@@ -39,6 +39,28 @@ func ExtractFirstSegment(cmd string) string {
 	return cmd
 }
 
+// HasUnverifiableConstruct reports whether cmd contains shell syntax that snip's
+// single-segment inspection cannot safely attest: command substitution ($(...)
+// or backticks), process substitution (<(...) or >(...)), or a carriage return
+// (which a hook never treats as a boundary). Such commands must never be
+// auto-allowed, because the substituted content is executed by the shell
+// without ever being inspected against the filter set. See issue #88.
+//
+// The markers are matched as plain substrings, deliberately ignoring quoting:
+// an argument such as grep '>(foo)' is reported as unverifiable even though the
+// shell would not expand it. The asymmetry of the two error modes justifies it.
+// A false positive costs one command left unfiltered, which the user still runs
+// normally; a false negative auto-allows a command snip never inspected, which
+// suppresses the confirmation prompt and is an authorization bypass. $( has the
+// same exposure and is handled the same way; stay conservative here.
+func HasUnverifiableConstruct(cmd string) bool {
+	return strings.Contains(cmd, "$(") ||
+		strings.Contains(cmd, "<(") ||
+		strings.Contains(cmd, ">(") ||
+		strings.IndexByte(cmd, '`') >= 0 ||
+		strings.IndexByte(cmd, '\r') >= 0
+}
+
 // ParseSegment decomposes a command segment into its parts:
 //   - prefix: leading whitespace
 //   - envVars: env var assignments (e.g. "CGO_ENABLED=0 ")

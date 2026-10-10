@@ -6,11 +6,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/edouard-claude/snip/internal/config"
 )
 
 const (
 	// hookIdentifier is used to detect snip entries in settings/hooks JSON.
 	hookIdentifier = "snip hook"
+	// hookIdentifierWindows is used to detect snip entries in settings/hooks JSON for Windows.
+	hookIdentifierWindows = "snip.exe hook"
 	// legacyHookFile is the old bash hook script filename (for migration).
 	legacyHookFile = "snip-rewrite.sh"
 )
@@ -18,19 +22,34 @@ const (
 // validAgents lists all supported agent names.
 var validAgents = []string{
 	"claude-code", "cursor", "codex", "pi", "windsurf", "cline",
-	"copilot", "gemini", "kilocode", "antigravity",
+	"copilot", "gemini", "kilocode", "antigravity", "grok",
 }
 
 // promptAgentFiles maps prompt-injection agents to their target file paths.
 // Paths may include subdirectories (created automatically on init).
 var promptAgentFiles = map[string]string{
 	"codex":       "AGENTS.md",
+	"grok":        "AGENTS.md",
 	"windsurf":    ".windsurfrules",
 	"cline":       ".clinerules",
 	"copilot":     filepath.Join(".github", "copilot-instructions.md"),
 	"gemini":      "GEMINI.md",
 	"kilocode":    filepath.Join(".kilocode", "rules", "snip-rules.md"),
-	"antigravity": filepath.Join(".agents", "rules", "snip-rules.md"),
+	"antigravity": filepath.Join(".agents", "rules", "snip-rules.md"), // using migration
+}
+
+// promptFileShared reports whether more than one agent writes filename. Shared
+// files (AGENTS.md, claimed by both codex and grok) carry agent-agnostic
+// content, so snip cannot tell which agent wrote one and must never delete it
+// on a single-agent uninstall.
+func promptFileShared(filename string) bool {
+	n := 0
+	for _, f := range promptAgentFiles {
+		if f == filename {
+			n++
+		}
+	}
+	return n > 1
 }
 
 // parseAgent extracts the --agent value from args.
@@ -119,9 +138,15 @@ func Run(args []string) error {
 		return fmt.Errorf("create filter dir: %w", err)
 	}
 
+	// Best-effort: seed a commented [economics.tiers] template so pricing
+	// is discoverable. Never blocks the install.
+	if err := ensureEconomicsSection(agent); err != nil {
+		fmt.Fprintf(os.Stderr, "snip: could not write economics template: %v\n", err)
+	}
+
 	switch agent {
 	case "claude-code":
-		return initClaudeCode(snipBin, home, filterDir)
+		return initClaudeCode(snipBin, filterDir)
 	case "cursor":
 		return initCursor(snipBin, home, filterDir)
 	case "codex":
@@ -133,7 +158,23 @@ func Run(args []string) error {
 		return initCodex(snipBin, home, filterDir)
 	case "pi":
 		return initPi(snipBin, home, filterDir)
-	case "windsurf", "cline", "copilot", "gemini", "kilocode", "antigravity":
+	case "copilot":
+		// Copilot CLI defaults to its GA runtime hook; --mode prompt selects the
+		// legacy .github/copilot-instructions.md prompt-injection path.
+		if mode == "prompt" {
+			return initPromptAgent(agent, snipBin, filterDir)
+		}
+		return initCopilotHook(snipBin, home, filterDir)
+	case "grok":
+		// Grok Build defaults to runtime hooks; --mode prompt selects the
+		// AGENTS.md prompt-injection path (Grok Build reads AGENTS.md natively).
+		if mode == "prompt" {
+			return initPromptAgent(agent, snipBin, filterDir)
+		}
+		return initGrok(snipBin, home, filterDir)
+	case "antigravity":
+		return initAntigravity(snipBin, filterDir)
+	case "windsurf", "cline", "gemini", "kilocode":
 		return initPromptAgent(agent, snipBin, filterDir)
 	}
 	return nil
@@ -158,16 +199,21 @@ func resolveSnipBin() (string, error) {
 }
 
 // initClaudeCode installs the snip hook for Claude Code.
-func initClaudeCode(snipBin, home, filterDir string) error {
+func initClaudeCode(snipBin, filterDir string) error {
+	claudeBase, err := config.ClaudeBaseDir()
+	if err != nil {
+		return fmt.Errorf("get home dir: %w", err)
+	}
+
 	// Migrate: remove old bash hook script if present
-	oldHookPath := filepath.Join(home, ".claude", "hooks", legacyHookFile)
+	oldHookPath := filepath.Join(claudeBase, "hooks", legacyHookFile)
 	if _, err := os.Stat(oldHookPath); err == nil {
 		_ = os.Remove(oldHookPath)
 		fmt.Printf("  migrated: removed old %s\n", legacyHookFile)
 	}
 
 	hookCommand := snipBin + " hook"
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	settingsPath := filepath.Join(claudeBase, "settings.json")
 	if err := patchClaudeSettings(settingsPath, hookCommand); err != nil {
 		return fmt.Errorf("patch settings: %w", err)
 	}
@@ -259,7 +305,13 @@ func Uninstall(agent string) error {
 		return uninstallCodex()
 	case "pi":
 		return uninstallPi()
-	case "windsurf", "cline", "copilot", "gemini", "kilocode", "antigravity":
+	case "copilot":
+		return uninstallCopilot()
+	case "grok":
+		return uninstallGrok()
+	case "antigravity":
+		return uninstallAntigravity()
+	case "windsurf", "cline", "gemini", "kilocode":
 		return uninstallPromptAgent(agent)
 	}
 	return nil
@@ -267,16 +319,16 @@ func Uninstall(agent string) error {
 
 // uninstallClaudeCode removes snip integration from Claude Code.
 func uninstallClaudeCode() error {
-	home, err := os.UserHomeDir()
+	claudeBase, err := config.ClaudeBaseDir()
 	if err != nil {
 		return fmt.Errorf("get home dir: %w", err)
 	}
 
 	// Remove legacy bash script if present
-	oldHookPath := filepath.Join(home, ".claude", "hooks", legacyHookFile)
+	oldHookPath := filepath.Join(claudeBase, "hooks", legacyHookFile)
 	_ = os.Remove(oldHookPath)
 
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	settingsPath := filepath.Join(claudeBase, "settings.json")
 	if err := unpatchClaudeSettings(settingsPath); err != nil {
 		return fmt.Errorf("unpatch settings: %w", err)
 	}
@@ -304,6 +356,19 @@ func uninstallCursor() error {
 // uninstallPromptAgent removes the prompt-injection file for the given agent.
 // For agents with subdirectory paths, it also removes empty parent directories.
 func uninstallPromptAgent(agent string) error {
+	err := removePromptAgent(agent)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("snip uninstalled (%s)\n", agent)
+	return nil
+}
+
+// removePromptAgent removes the prompt-injection file for the given agent.
+// For agents with subdirectory paths, it also removes empty parent directories.
+// Using uninstall prompt agent and migrate old hook prompt
+func removePromptAgent(agent string) error {
 	filename := promptAgentFiles[agent]
 	targetPath := filepath.Join(".", filename)
 
@@ -318,7 +383,6 @@ func uninstallPromptAgent(agent string) error {
 		}
 	}
 
-	fmt.Printf("snip uninstalled (%s)\n", agent)
 	return nil
 }
 
@@ -501,6 +565,35 @@ func isSnipCursorEntry(entry any) bool {
 		cmd, _ := hm["command"].(string)
 		if strings.Contains(cmd, hookIdentifier) {
 			return true
+		}
+	}
+	return false
+}
+
+func isSnipHookEntry(entry any, identifierArr []string) bool {
+	m, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	hooksRaw, ok := m["hooks"]
+	if !ok {
+		return false
+	}
+	hooksArr, ok := hooksRaw.([]any)
+	if !ok {
+		return false
+	}
+	for _, h := range hooksArr {
+		hm, ok := h.(map[string]any)
+		if !ok {
+			continue
+		}
+		cmd, _ := hm["command"].(string)
+		cmd = strings.NewReplacer("\"", "", "'", "").Replace(cmd)
+		for _, v := range identifierArr {
+			if strings.Contains(cmd, v) {
+				return true
+			}
 		}
 	}
 	return false

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/edouard-claude/snip/internal/config"
 	"github.com/edouard-claude/snip/internal/hook"
 )
 
@@ -30,7 +31,7 @@ type contentItem struct {
 	ID        string          `json:"id,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	Content   stringOrArray   `json:"content,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
+	IsError   *bool           `json:"is_error,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 }
 
@@ -69,24 +70,33 @@ type bashInput struct {
 	Command string `json:"command"`
 }
 
+// notRunMarkers identify tool results for commands that never executed: the
+// user rejected the call or interrupted the turn. They are flagged is_error,
+// but nothing failed, so such an entry is neither a failure nor a fix.
+var notRunMarkers = []string{
+	"The user doesn't want to proceed with this tool use",
+	"[Request interrupted by user",
+}
+
 // commandEntry represents a Bash command extracted from a session with its result.
 type commandEntry struct {
-	Command    string // full command string
-	BaseCmd    string // extracted base command name
-	ToolUseID  string // tool_use id for matching results
-	Output     string // tool result content (if found)
-	IsError    bool   // whether the tool result indicated an error
-	HasResult  bool   // whether a result was matched
-	Timestamp  string // timestamp from the JSONL entry
+	Command   string // full command string
+	BaseCmd   string // extracted base command name
+	ToolUseID string // tool_use id for matching results
+	Output    string // tool result content (if found)
+	IsError   bool   // whether the tool result indicated an error
+	HasResult bool   // whether a result was matched
+	NotRun    bool   // whether the command was rejected or interrupted
+	Timestamp string // timestamp from the JSONL entry
 }
 
 // ErrorPattern represents a detected error-correction pattern.
 type ErrorPattern struct {
-	BaseCommand    string // base command name (e.g. "go", "git")
-	ErrorCommand   string // the command that failed
-	ErrorOutput    string // truncated error output
-	FixCommand     string // the command that succeeded
-	Count          int    // number of times this pattern occurred
+	BaseCommand  string // base command name (e.g. "go", "git")
+	ErrorCommand string // the command that failed
+	ErrorOutput  string // truncated error output
+	FixCommand   string // the command that succeeded
+	Count        int    // number of times this pattern occurred
 }
 
 // PatternGroup aggregates similar error patterns by base command.
@@ -196,24 +206,20 @@ func parseArgs(args []string) Options {
 	return opts
 }
 
-// claudeProjectsDir returns the base Claude Code projects directory.
-func claudeProjectsDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".claude", "projects")
-}
-
 // cwdToProjectName converts a working directory path to the Claude Code
-// project directory name format.
+// project directory name format: every non-alphanumeric rune becomes a dash.
 func cwdToProjectName(cwd string) string {
-	return strings.ReplaceAll(cwd, string(os.PathSeparator), "-")
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, cwd)
 }
 
 // findProjectDirs returns the list of Claude Code project directories to scan.
 func findProjectDirs(opts Options) ([]string, error) {
-	base := claudeProjectsDir()
+	base := config.ClaudeProjectsDir()
 	if base == "" {
 		return nil, nil
 	}
@@ -375,29 +381,144 @@ func extractCommandEntries(path string, cutoff time.Time) []commandEntry {
 				}
 				entries[idx].HasResult = true
 				entries[idx].Output = item.Content.Value
-				entries[idx].IsError = item.IsError || looksLikeError(item.Content.Value)
+				entries[idx].IsError = resultIsError(item)
+				entries[idx].NotRun = isNotRun(item.Content.Value)
 			}
 		}
 	}
 
-	return entries
+	return dropNotRun(entries)
 }
 
-// extractBaseCommand parses a shell command string to extract the base command name.
-func extractBaseCommand(cmd string) string {
-	firstLine := cmd
-	if idx := strings.IndexByte(firstLine, '\n'); idx >= 0 {
-		firstLine = firstLine[:idx]
+// resultIsError reports whether a tool result describes a failed command. The
+// explicit is_error flag is authoritative when present; the output heuristic is
+// only a fallback, because it cannot tell a failure from a command that merely
+// prints an error message (a grep hit, a file listing).
+func resultIsError(item contentItem) bool {
+	if item.IsError != nil {
+		return *item.IsError
 	}
-	firstSegment := hook.ExtractFirstSegment(firstLine)
-	_, _, bareCmd := hook.ParseSegment(firstSegment)
+	return looksLikeError(item.Content.Value)
+}
+
+// isNotRun reports whether a tool result means the command never executed.
+func isNotRun(output string) bool {
+	for _, marker := range notRunMarkers {
+		if strings.Contains(output, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropNotRun removes the commands that never executed, keeping session order.
+func dropNotRun(entries []commandEntry) []commandEntry {
+	kept := entries[:0]
+	for _, e := range entries {
+		if !e.NotRun {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// navigationPrefixes are commands that only move around or set up the shell.
+// They carry no failure of their own, so attributing an error to them hides
+// the command that actually ran (e.g. "cd /path && npx ..." is about npx).
+var navigationPrefixes = map[string]bool{
+	"cd":     true,
+	"pushd":  true,
+	"popd":   true,
+	"export": true,
+	"source": true,
+	".":      true,
+}
+
+// extractBaseCommand parses a shell command string to extract the base command
+// name. It walks past leading segments that carry no command, so a chained
+// command reports the tool that really ran rather than its shell scaffolding.
+// The walk crosses newlines only while no command has been seen yet, which
+// keeps heredoc bodies out: they always follow the command that opens them.
+func extractBaseCommand(cmd string) string {
+	var first string
+	rest := cmd
+	for {
+		segment := hook.ExtractFirstSegment(rest)
+		base := segmentBase(segment)
+		if isCommandName(base) {
+			if first == "" {
+				first = base
+			}
+			if !navigationPrefixes[base] {
+				return base
+			}
+		}
+		if len(segment) >= len(rest) {
+			break
+		}
+		rest = strings.TrimLeft(rest[len(segment):], ";|&\n \t")
+		if rest == "" {
+			break
+		}
+	}
+
+	// Every segment was scaffolding: keep the first one rather than nothing.
+	return first
+}
+
+// segmentBase reduces a single command segment to its executable name, or to
+// the empty string when the segment holds no command at all.
+func segmentBase(segment string) string {
+	_, _, bareCmd := hook.ParseSegment(segment)
 	base := hook.BaseCommand(bareCmd)
+	if looksLikeAssignment(base) {
+		return ""
+	}
 
 	if idx := strings.LastIndexByte(base, '/'); idx >= 0 {
 		base = base[idx+1:]
 	}
-	base = strings.Trim(base, "'\"")
-	return base
+	return strings.Trim(base, "'\"")
+}
+
+// isCommandName reports whether a word can be an executable name. Walking past
+// scaffolding can land in the middle of a command substitution or a redirection
+// (e.g. "$(cat /tmp/jwt.txt)"), and such fragments must not be reported as
+// commands.
+func isCommandName(word string) bool {
+	if word == "" {
+		return false
+	}
+	for i := 0; i < len(word); i++ {
+		c := word[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '_', c == '-', c == '+':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeAssignment reports whether a word is a KEY=VALUE assignment rather
+// than a command. ParseSegment only strips assignments followed by a command,
+// so a segment made of assignments alone reaches here intact.
+func looksLikeAssignment(word string) bool {
+	eq := strings.IndexByte(word, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i := 0; i < eq; i++ {
+		c := word[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // looksLikeError checks if command output contains common error indicators.
@@ -419,7 +540,7 @@ func detectPatterns(entries []commandEntry) []ErrorPattern {
 	var patterns []ErrorPattern
 
 	for i, entry := range entries {
-		if !entry.IsError {
+		if !entry.IsError || entry.BaseCmd == "" {
 			continue
 		}
 
@@ -589,6 +710,7 @@ func generateRules(r Result) error {
 		return nil
 	}
 
+	// Project-relative, not CLAUDE_CONFIG_DIR: rules live with the project, not user config.
 	dir := filepath.Join(".claude", "rules")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create rules directory: %w", err)

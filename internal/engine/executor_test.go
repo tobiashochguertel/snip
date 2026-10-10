@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"errors"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExecuteEcho(t *testing.T) {
@@ -53,6 +56,114 @@ func TestExecuteNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for nonexistent command")
 	}
+}
+
+// A nil *Result is how Execute signals "the command never ran". An error does
+// not carry that meaning, since it can also mean the command ran to completion
+// and only the wait bookkeeping failed. Callers decide from the Result whether
+// re-running is safe, so this invariant has to hold.
+func TestExecuteNilResultOnlyWhenNeverStarted(t *testing.T) {
+	result, err := Execute("nonexistent-command-xyz", nil)
+	if err == nil {
+		t.Fatal("expected error for nonexistent command")
+	}
+	if result != nil {
+		t.Errorf("result must be nil when the command never started, got %+v", result)
+	}
+
+	if runtime.GOOS == "windows" {
+		t.Skip("skip on windows")
+	}
+	result, err = Execute("sh", []string{"-c", "echo out; echo err >&2; exit 3"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("result must be non-nil for a command that ran")
+	}
+	if result.ExitCode != 3 {
+		t.Errorf("exit code = %d, want 3", result.ExitCode)
+	}
+	if strings.TrimSpace(result.Stdout) != "out" || strings.TrimSpace(result.Stderr) != "err" {
+		t.Errorf("output not captured: stdout=%q stderr=%q", result.Stdout, result.Stderr)
+	}
+}
+
+// resultFrom holds the whole post-wait decision of Execute. Its non-ExitError
+// branch is the one issue #119 is about, and no real command can reach it: the
+// Go runtime owns SIGCHLD and os/exec offers no seam on the wait syscall. So it
+// is exercised here directly, on the helper.
+func TestResultFrom(t *testing.T) {
+	const (
+		stdout = "captured out\n"
+		stderr = "captured err\n"
+	)
+	const dur = 7 * time.Millisecond
+
+	t.Run("wait bookkeeping failed", func(t *testing.T) {
+		boom := errors.New("boom")
+
+		result, err := resultFrom(boom, stdout, stderr, dur)
+
+		if err == nil {
+			t.Fatal("a non-ExitError from wait must be reported")
+		}
+		if !errors.Is(err, boom) {
+			t.Errorf("error must wrap the wait error, got %v", err)
+		}
+		if result == nil {
+			t.Fatal("result must be non-nil: the command ran and re-running it would repeat its side effects")
+		}
+		if result.Stdout != stdout || result.Stderr != stderr {
+			t.Errorf("captured output lost: stdout=%q stderr=%q", result.Stdout, result.Stderr)
+		}
+		if result.Duration != dur {
+			t.Errorf("duration = %v, want %v", result.Duration, dur)
+		}
+	})
+
+	t.Run("exit error", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("skip on windows")
+		}
+		waitErr := exec.Command("sh", "-c", "exit 3").Run()
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			t.Fatalf("setup: want *exec.ExitError, got %T (%v)", waitErr, waitErr)
+		}
+
+		result, err := resultFrom(waitErr, stdout, stderr, dur)
+
+		if err != nil {
+			t.Fatalf("a failing command is not an error of Execute, got %v", err)
+		}
+		if result == nil {
+			t.Fatal("result must be non-nil")
+		}
+		if result.ExitCode != 3 {
+			t.Errorf("exit code = %d, want 3", result.ExitCode)
+		}
+		if result.Stdout != stdout || result.Stderr != stderr {
+			t.Errorf("captured output lost: stdout=%q stderr=%q", result.Stdout, result.Stderr)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		result, err := resultFrom(nil, stdout, stderr, dur)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result == nil {
+			t.Fatal("result must be non-nil")
+		}
+		if result.ExitCode != 0 {
+			t.Errorf("exit code = %d, want 0", result.ExitCode)
+		}
+		if result.Stdout != stdout || result.Stderr != stderr {
+			t.Errorf("captured output lost: stdout=%q stderr=%q", result.Stdout, result.Stderr)
+		}
+	})
 }
 
 func TestPassthrough(t *testing.T) {
@@ -123,5 +234,91 @@ func TestMakeCommandRegular(t *testing.T) {
 	// Should NOT wrap with sh
 	if len(cmd.Args) > 0 && cmd.Args[0] == "sh" {
 		t.Error("regular commands should not be wrapped with sh")
+	}
+}
+
+// A command that leaves a process running in the background hands that
+// descendant its copies of the pipe write ends, so the pipes only reach EOF
+// once the descendant exits too. Execute must not wait for it.
+//
+// The descendant writes well after the grace period, which pins both sides of
+// the trade-off: everything the command itself wrote is captured, and the late
+// write is dropped rather than waited for.
+func TestExecuteDoesNotWaitForBackgroundDescendants(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip on windows")
+	}
+	started := time.Now()
+	result, err := Execute("sh", []string{"-c", "(sleep 5; echo late) & echo started"})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.TrimSpace(result.Stdout); got != "started" {
+		t.Errorf("stdout = %q, want %q", got, "started")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("Execute blocked for %s on a background descendant", elapsed)
+	}
+}
+
+// shrinkDrainGrace lowers the drain grace period for the duration of a test so
+// the truncation boundary can be forced without a multi-second wait.
+func shrinkDrainGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := drainGrace
+	drainGrace = d
+	t.Cleanup(func() { drainGrace = old })
+}
+
+// Dropping the late output is the intended trade-off, but the caller must be
+// able to tell that it happened: unflagged truncation is indistinguishable from
+// complete output.
+func TestExecuteFlagsTruncatedWhenDrainGraceExpires(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip on windows")
+	}
+	shrinkDrainGrace(t, 50*time.Millisecond)
+
+	result, err := Execute("sh", []string{"-c", "(sleep 1; echo LATE) & echo early"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.TrimSpace(result.Stdout); got != "early" {
+		t.Fatalf("stdout = %q, want %q", got, "early")
+	}
+	if !result.Truncated {
+		t.Error("Result.Truncated = false, want true: the drain gave up with output still pending")
+	}
+}
+
+// The flag must stay off for the overwhelmingly common case, or every command
+// would carry a truncation warning.
+func TestExecuteDoesNotFlagTruncatedForCompleteOutput(t *testing.T) {
+	result, err := Execute("echo", []string{"hello"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Truncated {
+		t.Error("Result.Truncated = true, want false: the command's output was fully drained")
+	}
+}
+
+// Output well past the pipe buffer makes the command block on write until the
+// reader drains. Nothing may be truncated, and neither side may deadlock.
+func TestExecuteLargeOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip on windows")
+	}
+	const want = 200000
+	result, err := Execute("sh", []string{"-c", "seq 1 200000"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.Count(result.Stdout, "\n"); got != want {
+		t.Errorf("captured %d lines, want %d", got, want)
+	}
+	if got := strings.TrimSpace(result.Stdout); !strings.HasSuffix(got, "\n200000") {
+		t.Errorf("output truncated, ends with %q", got[max(0, len(got)-20):])
 	}
 }

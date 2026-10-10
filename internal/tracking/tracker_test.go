@@ -3,9 +3,34 @@
 package tracking
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// TestTrackUnwritableDBIsUnavailable verifies that when the tracking DB path is
+// unwritable (sandboxed/read-only filesystem), Track returns an error wrapping
+// ErrUnavailable so best-effort callers can degrade silently (issue #93).
+func TestTrackUnwritableDBIsUnavailable(t *testing.T) {
+	// A regular file used as a parent directory makes os.MkdirAll fail with
+	// ENOTDIR, deterministically simulating an unwritable DB location.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(blocker, "sub", "tracking.db")
+
+	tr := NewLazyTracker(dbPath)
+	err := tr.Track("git status", "snip run -- git status", 100, 10, 5)
+	if err == nil {
+		t.Fatal("expected an error when the DB path is unwritable")
+	}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("error %v should wrap ErrUnavailable", err)
+	}
+}
 
 func newTestTracker(t *testing.T) *Tracker {
 	t.Helper()
@@ -16,6 +41,51 @@ func newTestTracker(t *testing.T) *Tracker {
 	}
 	t.Cleanup(func() { _ = tracker.Close() })
 	return tracker
+}
+
+func TestTrackUnfiltered(t *testing.T) {
+	tr := newTestTracker(t)
+
+	if err := tr.TrackUnfiltered("cargo", "cargo build"); err != nil {
+		t.Fatalf("track unfiltered: %v", err)
+	}
+	if err := tr.TrackUnfiltered("cargo", "cargo build --release"); err != nil {
+		t.Fatalf("track unfiltered: %v", err)
+	}
+	if err := tr.TrackUnfiltered("make", "make all"); err != nil {
+		t.Fatalf("track unfiltered: %v", err)
+	}
+
+	stats, err := tr.GetUnfiltered(10)
+	if err != nil {
+		t.Fatalf("get unfiltered: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("got %d unfiltered commands, want 2", len(stats))
+	}
+	// Ordered by frequency DESC: cargo (2 runs) before make (1 run).
+	if stats[0].Command != "cargo" {
+		t.Errorf("first = %q, want cargo", stats[0].Command)
+	}
+	if stats[0].Count != 2 {
+		t.Errorf("cargo count = %d, want 2", stats[0].Count)
+	}
+	if stats[1].Command != "make" || stats[1].Count != 1 {
+		t.Errorf("second = %q (count %d), want make (1)", stats[1].Command, stats[1].Count)
+	}
+}
+
+// TestGetUnfilteredEmpty verifies an empty result (and table creation) when
+// nothing has been recorded.
+func TestGetUnfilteredEmpty(t *testing.T) {
+	tr := newTestTracker(t)
+	stats, err := tr.GetUnfiltered(10)
+	if err != nil {
+		t.Fatalf("get unfiltered: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Errorf("expected no rows, got %d", len(stats))
+	}
 }
 
 func TestNewTracker(t *testing.T) {
@@ -197,5 +267,50 @@ func TestDBPath(t *testing.T) {
 	t.Setenv("SNIP_DB_PATH", "")
 	if got := DBPath("/config/path.db"); got != "/config/path.db" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestDBPathDefault(t *testing.T) {
+	t.Setenv("SNIP_DB_PATH", "")
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	path := DBPath("")
+	expected := filepath.Join(tmpDir, ".local", "share", "snip", "tracking.db")
+	if path != expected {
+		t.Errorf("DBPath() = %q, want %q", path, expected)
+	}
+}
+
+func TestWarmUp(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "warmup.db")
+	tr := NewLazyTracker(dbPath)
+	tr.WarmUp()
+
+	// WarmUp runs in background; track should work after warm-up.
+	// Give it a moment.
+	time.Sleep(50 * time.Millisecond)
+	err := tr.Track("test", "snip test", 100, 50, 10)
+	if err != nil {
+		t.Fatalf("track after warmup: %v", err)
+	}
+	_ = tr.Close()
+}
+
+func TestCloseNilDB(t *testing.T) {
+	tr := &Tracker{}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close on nil db: %v", err)
+	}
+}
+
+func TestGetUnfilteredDefaultLimit(t *testing.T) {
+	tr := newTestTracker(t)
+	stats, err := tr.GetUnfiltered(0)
+	if err != nil {
+		t.Fatalf("get unfiltered default: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Errorf("expected no rows, got %d", len(stats))
 	}
 }

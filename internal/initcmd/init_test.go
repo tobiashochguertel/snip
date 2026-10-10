@@ -329,7 +329,7 @@ func TestParseAgentEquals(t *testing.T) {
 func TestIsValidAgent(t *testing.T) {
 	valid := []string{
 		"claude-code", "cursor", "codex", "windsurf", "cline",
-		"copilot", "gemini", "kilocode", "antigravity",
+		"copilot", "gemini", "kilocode", "antigravity", "grok",
 	}
 	for _, a := range valid {
 		if !isValidAgent(a) {
@@ -515,12 +515,12 @@ func TestPromptAgentFiles(t *testing.T) {
 		filename string
 	}{
 		{"codex", "AGENTS.md"},
+		{"grok", "AGENTS.md"},
 		{"windsurf", ".windsurfrules"},
 		{"cline", ".clinerules"},
 		{"copilot", filepath.Join(".github", "copilot-instructions.md")},
 		{"gemini", "GEMINI.md"},
 		{"kilocode", filepath.Join(".kilocode", "rules", "snip-rules.md")},
-		{"antigravity", filepath.Join(".agents", "rules", "snip-rules.md")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.agent, func(t *testing.T) {
@@ -620,6 +620,69 @@ func TestRunUnknownAgent(t *testing.T) {
 	}
 }
 
+func TestInitClaudeCodeRespectsClaudeConfigDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+
+	filterDir := t.TempDir()
+	err := initClaudeCode("/usr/local/bin/snip", filterDir)
+	if err != nil {
+		t.Fatalf("initClaudeCode: %v", err)
+	}
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	if _, err := os.Stat(settingsPath); err != nil {
+		t.Errorf("expected settings.json at %s honoring CLAUDE_CONFIG_DIR: %v", settingsPath, err)
+	}
+}
+
+func TestInitClaudeCodeMigratesLegacyHookUnderClaudeConfigDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+
+	hooksDir := filepath.Join(claudeDir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldHookPath := filepath.Join(hooksDir, legacyHookFile)
+	if err := os.WriteFile(oldHookPath, []byte("#!/bin/bash\nexit 0"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	filterDir := t.TempDir()
+	if err := initClaudeCode("/usr/local/bin/snip", filterDir); err != nil {
+		t.Fatalf("initClaudeCode: %v", err)
+	}
+
+	if _, err := os.Stat(oldHookPath); !os.IsNotExist(err) {
+		t.Error("legacy hook script under CLAUDE_CONFIG_DIR should be removed")
+	}
+}
+
+func TestUninstallClaudeCodeRespectsClaudeConfigDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	if err := patchClaudeSettings(settingsPath, "/usr/local/bin/snip hook"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := uninstallClaudeCode(); err != nil {
+		t.Fatalf("uninstallClaudeCode: %v", err)
+	}
+
+	settings := readSettings(t, settingsPath)
+	if hooks, ok := settings["hooks"].(map[string]any); ok {
+		if _, ok := hooks["PreToolUse"]; ok {
+			t.Error("expected snip hook removed from CLAUDE_CONFIG_DIR settings")
+		}
+	}
+}
+
 func readSettings(t *testing.T, path string) map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -631,4 +694,18 @@ func readSettings(t *testing.T, path string) map[string]any {
 		t.Fatalf("parse settings: %v", err)
 	}
 	return settings
+}
+
+func TestResolveSnipBin(t *testing.T) {
+	bin, err := resolveSnipBin()
+	if err != nil {
+		t.Fatalf("resolveSnipBin: %v", err)
+	}
+	if bin == "" {
+		t.Error("expected non-empty path")
+	}
+	// Should be an absolute path.
+	if !filepath.IsAbs(bin) {
+		t.Errorf("expected absolute path, got %q", bin)
+	}
 }

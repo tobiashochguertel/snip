@@ -2,12 +2,15 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/edouard-claude/snip/internal/config"
 	"github.com/edouard-claude/snip/internal/filter"
 )
 
@@ -127,6 +130,28 @@ func TestApplyPipelineGracefulDegradation(t *testing.T) {
 	}
 }
 
+func TestShouldRestoreRaw(t *testing.T) {
+	cases := []struct {
+		name     string
+		filtered string
+		raw      string
+		want     bool
+	}{
+		{"emptied non-empty input", "\n", "real output\nmore\n", true},
+		{"whitespace-only result", "   \n\t\n", "real output\n", true},
+		{"normal filtered output", "kept\n", "kept\ndropped\n", false},
+		{"legitimately empty input", "\n", "\n", false},
+		{"both empty", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRestoreRaw(tc.filtered, tc.raw); got != tc.want {
+				t.Errorf("shouldRestoreRaw(%q, %q) = %v, want %v", tc.filtered, tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsFilterEnabledNilMap(t *testing.T) {
 	p := &Pipeline{FilterEnabled: nil}
 	for _, name := range []string{"git-diff", "git-status", "unknown"} {
@@ -202,7 +227,6 @@ func TestPipelineRunSilentWhenFilterExcludedByFlags(t *testing.T) {
 		Name:    "true-json",
 		Version: 1,
 		Match:   filter.Match{Command: "true", RequireFlags: []string{"--json"}},
-		OnError: "passthrough",
 		Pipeline: filter.Pipeline{
 			{ActionName: "keep_lines", Params: map[string]any{"pattern": `.`}},
 		},
@@ -246,8 +270,7 @@ func TestPipelineRunSilentWhenSiblingSubcommandHasFilter(t *testing.T) {
 	f := filter.Filter{
 		Name:    "true-foo",
 		Version: 1,
-		Match:   filter.Match{Command: "true", Subcommand: "foo"},
-		OnError: "passthrough",
+		Match:   filter.Match{Command: "true", Subcommand: filter.NewSubcommand("foo")},
 		Pipeline: filter.Pipeline{
 			{ActionName: "keep_lines", Params: map[string]any{"pattern": `.`}},
 		},
@@ -274,5 +297,487 @@ func TestPipelineRunSilentWhenSiblingSubcommandHasFilter(t *testing.T) {
 
 	if strings.Contains(buf.String(), "no filter for") {
 		t.Errorf("expected silent stderr when sibling subcommand filter exists, got: %q", buf.String())
+	}
+}
+
+func TestApplyOverrideHead(t *testing.T) {
+	f := filterForTest("test-filter",
+		filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+			{ActionName: "head", Params: map[string]any{"n": 10}},
+		},
+	)
+
+	o := config.FilterOverride{Head: 25}
+	applyOverride(&f, &o)
+
+	if f.Pipeline[1].Params["n"] != 25 {
+		t.Errorf("head n = %v, want 25", f.Pipeline[1].Params["n"])
+	}
+}
+
+func TestApplyOverrideStreamModeFull(t *testing.T) {
+	f := filterForTest("test-filter",
+		filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+			{ActionName: "head", Params: map[string]any{"n": 10}},
+		},
+	)
+
+	o := config.FilterOverride{StreamMode: "full"}
+	applyOverride(&f, &o)
+
+	if f.Pipeline != nil {
+		t.Errorf("pipeline should be nil after stream_mode=full, got %v", f.Pipeline)
+	}
+}
+
+func TestApplyGlobalLimit(t *testing.T) {
+	f := filterForTest("test-filter",
+		filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+		},
+	)
+
+	origLen := len(f.Pipeline)
+	g := config.FilterGlobalConfig{MaxLines: 50, MaxLineLength: 120}
+	applyGlobalLimit(&f, &g)
+
+	if len(f.Pipeline) != origLen+2 {
+		t.Fatalf("pipeline len = %d, want %d", len(f.Pipeline), origLen+2)
+	}
+	lastTwo := f.Pipeline[len(f.Pipeline)-2:]
+	if lastTwo[0].ActionName != "head" || lastTwo[0].Params["n"] != 50 {
+		t.Errorf("expected head(50), got %v", lastTwo[0])
+	}
+	if lastTwo[1].ActionName != "truncate_lines" || lastTwo[1].Params["max"] != 120 {
+		t.Errorf("expected truncate_lines(120), got %v", lastTwo[1])
+	}
+}
+
+func TestApplyOverrideDoesNotMutateRegistry(t *testing.T) {
+	// Verify that Clone() prevents mutations from leaking into the registry.
+	original := filterForTest("test-override",
+		filter.Pipeline{
+			{ActionName: "head", Params: map[string]any{"n": 10}},
+			{ActionName: "tail", Params: map[string]any{"n": 5}},
+		},
+	)
+
+	// Simulate what Pipeline.Run does: match, then clone.
+	cloned := original.Clone()
+
+	o := config.FilterOverride{Head: 99, Tail: 88}
+	applyOverride(cloned, &o)
+
+	// Original should be unchanged
+	if original.Pipeline[0].Params["n"] != 10 {
+		t.Errorf("original head n = %v, want 10 (was corrupted)", original.Pipeline[0].Params["n"])
+	}
+	if original.Pipeline[1].Params["n"] != 5 {
+		t.Errorf("original tail n = %v, want 5 (was corrupted)", original.Pipeline[1].Params["n"])
+	}
+	// Clone should be changed
+	if cloned.Pipeline[0].Params["n"] != 99 {
+		t.Errorf("cloned head n = %v, want 99", cloned.Pipeline[0].Params["n"])
+	}
+	if cloned.Pipeline[1].Params["n"] != 88 {
+		t.Errorf("cloned tail n = %v, want 88", cloned.Pipeline[1].Params["n"])
+	}
+}
+
+func TestApplyGlobalLimitDoesNotMutateRegistry(t *testing.T) {
+	original := filterForTest("test-global",
+		filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+		},
+	)
+
+	cloned := original.Clone()
+	origLen := len(original.Pipeline)
+
+	g := config.FilterGlobalConfig{MaxLines: 50, MaxLineLength: 120}
+	applyGlobalLimit(cloned, &g)
+
+	// Original pipeline should still have same length
+	if len(original.Pipeline) != origLen {
+		t.Errorf("original pipeline grew from %d to %d (registry corrupted)", origLen, len(original.Pipeline))
+	}
+	// Clone should have extra actions
+	if len(cloned.Pipeline) != origLen+2 {
+		t.Errorf("cloned pipeline len = %d, want %d", len(cloned.Pipeline), origLen+2)
+	}
+}
+
+func TestBypassCommand(t *testing.T) {
+	// Test that bypass list sends command through passthrough unconditionally.
+	// We use "echo" since it exists everywhere and is test-friendly.
+	f := filterForTest("echo", filter.Pipeline{
+		{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+	})
+	reg := filter.NewRegistry([]filter.Filter{f})
+
+	cfg := &config.Config{
+		Filters: config.FiltersConfig{
+			Bypass: config.FilterBypassConfig{
+				Commands: []string{"echo"},
+			},
+		},
+	}
+
+	p := &Pipeline{
+		Registry: reg,
+		Config:   cfg,
+	}
+
+	// "echo" is in bypass — should passthrough (raw output, not filtered)
+	code := p.Run("echo", []string{"hello bypass!"})
+	if code != 0 {
+		t.Errorf("bypass exit code = %d, want 0", code)
+	}
+}
+
+func filterForTest(name string, pipeline filter.Pipeline) filter.Filter {
+	return filter.Filter{
+		Name:     name,
+		Version:  1,
+		Match:    filter.Match{Command: name},
+		Pipeline: pipeline,
+	}
+}
+
+func TestApplyGlobalLimit_MaxOutputBytes(t *testing.T) {
+	f := &filter.Filter{Pipeline: filter.Pipeline{}}
+	g := &config.FilterGlobalConfig{MaxOutputBytes: 100}
+
+	applyGlobalLimit(f, g)
+
+	if len(f.Pipeline) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(f.Pipeline))
+	}
+	if f.Pipeline[0].ActionName != "truncate_bytes" {
+		t.Errorf("action name = %q, want truncate_bytes", f.Pipeline[0].ActionName)
+	}
+	max, _ := f.Pipeline[0].Params["max"].(int)
+	if max != 100 {
+		t.Errorf("max = %d, want 100", max)
+	}
+}
+
+func TestApplyGlobalLimit_ZeroIsNoOp(t *testing.T) {
+	f := &filter.Filter{Pipeline: filter.Pipeline{}}
+	g := &config.FilterGlobalConfig{} // all zeros
+
+	applyGlobalLimit(f, g)
+
+	if len(f.Pipeline) != 0 {
+		t.Errorf("expected 0 actions for zero limits, got %d", len(f.Pipeline))
+	}
+}
+
+func TestApplyOverrideAppendsWhenActionNotInPipeline(t *testing.T) {
+	f := &filter.Filter{
+		Pipeline: filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+		},
+	}
+	o := config.FilterOverride{Head: 25}
+	applyOverride(f, &o)
+
+	if len(f.Pipeline) != 2 {
+		t.Fatalf("pipeline len = %d, want 2", len(f.Pipeline))
+	}
+	last := f.Pipeline[len(f.Pipeline)-1]
+	if last.ActionName != "head" {
+		t.Errorf("last action name = %q, want head", last.ActionName)
+	}
+	if last.Params["n"] != 25 {
+		t.Errorf("head n = %v, want 25", last.Params["n"])
+	}
+}
+
+func TestApplyOverrideAppendsMultipleUnmatchedActions(t *testing.T) {
+	f := &filter.Filter{Pipeline: filter.Pipeline{}}
+	o := config.FilterOverride{Head: 25, TruncateLines: 120, KeepLines: "error|warn"}
+	applyOverride(f, &o)
+
+	if len(f.Pipeline) != 3 {
+		t.Fatalf("pipeline len = %d, want 3", len(f.Pipeline))
+	}
+	names := map[string]bool{}
+	for _, a := range f.Pipeline {
+		names[a.ActionName] = true
+	}
+	for _, want := range []string{"head", "truncate_lines", "keep_lines"} {
+		if !names[want] {
+			t.Errorf("pipeline missing action %q", want)
+		}
+	}
+}
+
+func TestApplyOverrideDoesNotDuplicateExistingActions(t *testing.T) {
+	f := &filter.Filter{
+		Pipeline: filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+			{ActionName: "head", Params: map[string]any{"n": 10}},
+		},
+	}
+	o := config.FilterOverride{Head: 25}
+	applyOverride(f, &o)
+
+	if len(f.Pipeline) != 2 {
+		t.Fatalf("pipeline len = %d, want 2 (no duplicate)", len(f.Pipeline))
+	}
+	if f.Pipeline[1].Params["n"] != 25 {
+		t.Errorf("head n = %v, want 25 (updated in place)", f.Pipeline[1].Params["n"])
+	}
+}
+
+func TestApplyOverrideZeroValueIsNoOp(t *testing.T) {
+	f := &filter.Filter{
+		Pipeline: filter.Pipeline{
+			{ActionName: "head", Params: map[string]any{"n": 10}},
+		},
+	}
+	o := config.FilterOverride{Head: 0}
+	applyOverride(f, &o)
+
+	if len(f.Pipeline) != 1 {
+		t.Fatalf("pipeline len = %d, want 1", len(f.Pipeline))
+	}
+	if f.Pipeline[0].Params["n"] != 10 {
+		t.Errorf("head n = %v, want 10 unchanged", f.Pipeline[0].Params["n"])
+	}
+}
+
+func TestApplyOverrideAppendPreservesCloneIsolation(t *testing.T) {
+	original := &filter.Filter{
+		Pipeline: filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `\S`}},
+		},
+	}
+	clone := original.Clone()
+	o := config.FilterOverride{Head: 25}
+	applyOverride(clone, &o)
+
+	if len(original.Pipeline) != 1 {
+		t.Errorf("original pipeline len = %d, want 1 (should not be mutated)", len(original.Pipeline))
+	}
+	if len(clone.Pipeline) != 2 {
+		t.Errorf("clone pipeline len = %d, want 2", len(clone.Pipeline))
+	}
+}
+
+func TestApplyOverrideNilParamsDoesNotPanic(t *testing.T) {
+	f := &filter.Filter{
+		Pipeline: filter.Pipeline{
+			{ActionName: "head", Params: nil},
+			{ActionName: "keep_lines", Params: nil},
+		},
+	}
+	o := config.FilterOverride{Head: 25, KeepLines: "error|warn"}
+	applyOverride(f, &o)
+
+	if f.Pipeline[0].Params["n"] != 25 {
+		t.Errorf("head n = %v, want 25 (nil Params should be initialized)", f.Pipeline[0].Params["n"])
+	}
+	if f.Pipeline[1].Params["pattern"] != "error|warn" {
+		t.Errorf("keep_lines pattern = %v, want error|warn", f.Pipeline[1].Params["pattern"])
+	}
+}
+
+// Run falls back to Passthrough only on a nil *Result, the one case where
+// re-running the command is safe. The filter matches so Run reaches Execute,
+// and the command does not exist so Execute returns nil. Run must fall back
+// rather than dereference the nil Result.
+func TestPipelineRunFallsBackWhenCommandNeverRan(t *testing.T) {
+	const missing = "nonexistent-command-xyz"
+	f := filter.Filter{
+		Name:    "missing-tool",
+		Version: 1,
+		Match:   filter.Match{Command: missing},
+		Pipeline: filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `.`}},
+		},
+	}
+	p := &Pipeline{
+		Registry: filter.NewRegistry([]filter.Filter{f}),
+		Verbose:  1,
+	}
+
+	// NOTE: not safe under t.Parallel() since os.Stderr is global.
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	code := p.Run(missing, nil)
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stderr = oldStderr
+
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 from the passthrough fallback", code)
+	}
+	// Both errors are reported under -v: the one that triggered the fallback and
+	// the fallback's own.
+	for _, want := range []string{"execute error", "passthrough error"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("stderr missing %q, got %q", want, buf.String())
+		}
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what
+// was written. NOTE: not safe under t.Parallel() since os.Stdout is global.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+
+	os.Stdout = old
+	_ = w.Close()
+	out := <-done
+	_ = r.Close()
+	return out
+}
+
+// shPassthroughFilter matches "sh" and keeps every line, so the filtered output
+// is the raw output plus whatever the engine adds.
+func shPassthroughFilter() filter.Filter {
+	return filter.Filter{
+		Name:    "sh-passthrough",
+		Version: 1,
+		Match:   filter.Match{Command: "sh"},
+		Pipeline: filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `.`}},
+		},
+	}
+}
+
+// A background descendant holding the pipe makes the engine drop output. The
+// LLM reading the filtered result is the consumer that matters, so the loss is
+// announced in that result rather than only on stderr.
+func TestPipelineRunMarksOutputDroppedByDrainGrace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip on windows")
+	}
+	shrinkDrainGrace(t, 50*time.Millisecond)
+
+	p := &Pipeline{Registry: filter.NewRegistry([]filter.Filter{shPassthroughFilter()})}
+	out := captureStdout(t, func() {
+		p.Run("sh", []string{"-c", "(sleep 1; echo LATE) & echo early"})
+	})
+
+	if !strings.Contains(out, "early") {
+		t.Errorf("stdout lost the command's own output, got %q", out)
+	}
+	if strings.Contains(out, "LATE") {
+		t.Fatalf("premise broken: the late write was not dropped, got %q", out)
+	}
+	if !strings.Contains(out, truncatedMarker) {
+		t.Errorf("stdout missing the truncation marker, got %q", out)
+	}
+}
+
+// A command whose output drains completely must not carry the marker, or every
+// invocation would warn about a loss that did not happen.
+func TestPipelineRunDoesNotMarkCompleteOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip on windows")
+	}
+
+	p := &Pipeline{Registry: filter.NewRegistry([]filter.Filter{shPassthroughFilter()})}
+	out := captureStdout(t, func() {
+		p.Run("sh", []string{"-c", "echo complete"})
+	})
+
+	if !strings.Contains(out, "complete") {
+		t.Fatalf("premise broken: missing command output, got %q", out)
+	}
+	if strings.Contains(out, truncatedMarker) {
+		t.Errorf("stdout carries the truncation marker for complete output: %q", out)
+	}
+}
+
+// The counterpart of TestPipelineRunFallsBackWhenCommandNeverRan: a non-nil
+// Result alongside a non-nil error means the command did run, so Run must use
+// that Result instead of re-running the command and repeating its side effects
+// (issue #119). No real command produces that pair, hence the execute seam.
+func TestPipelineRunDoesNotFallBackWhenCommandRan(t *testing.T) {
+	// A command that cannot be executed: should Run wrongly fall back, the
+	// Passthrough attempt is loud and its exit code differs from the Result's.
+	const missing = "nonexistent-command-xyz"
+	f := filter.Filter{
+		Name:    "ran-tool",
+		Version: 1,
+		Match:   filter.Match{Command: missing},
+		Pipeline: filter.Pipeline{
+			{ActionName: "keep_lines", Params: map[string]any{"pattern": `kept`}},
+		},
+	}
+	executed := 0
+	p := &Pipeline{
+		Registry: filter.NewRegistry([]filter.Filter{f}),
+		Verbose:  1,
+		execute: func(string, []string) (*Result, error) {
+			executed++
+			return &Result{Stdout: "kept line\ndropped line\n"}, errors.New("wait command: boom")
+		},
+	}
+
+	// NOTE: not safe under t.Parallel() since os.Stdout/os.Stderr are global.
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outW, errW
+	t.Cleanup(func() { os.Stdout, os.Stderr = oldStdout, oldStderr })
+
+	code := p.Run(missing, nil)
+
+	_ = outW.Close()
+	_ = errW.Close()
+	var outBuf, errBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, outR)
+	_, _ = io.Copy(&errBuf, errR)
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+
+	if executed != 1 {
+		t.Errorf("command executed %d times, want exactly 1", executed)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0 from the Result", code)
+	}
+	if !strings.Contains(outBuf.String(), "kept line") || strings.Contains(outBuf.String(), "dropped line") {
+		t.Errorf("captured output was not filtered and printed, got %q", outBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "exit status unknown") {
+		t.Errorf("stderr must report the lost exit status, got %q", errBuf.String())
+	}
+	if strings.Contains(errBuf.String(), "passthrough") {
+		t.Errorf("Run fell back to passthrough for a command that already ran, stderr: %q", errBuf.String())
 	}
 }

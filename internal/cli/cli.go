@@ -17,6 +17,7 @@ import (
 	"github.com/edouard-claude/snip/internal/hook"
 	"github.com/edouard-claude/snip/internal/hookaudit"
 	"github.com/edouard-claude/snip/internal/initcmd"
+	"github.com/edouard-claude/snip/internal/inspect"
 	"github.com/edouard-claude/snip/internal/learn"
 	"github.com/edouard-claude/snip/internal/tee"
 	"github.com/edouard-claude/snip/internal/tracking"
@@ -45,6 +46,13 @@ func Run(args []string) int {
 		return 0
 	}
 
+	// A hook-rewritten command carries the plugin config as a flag because
+	// the agent's shell does not inherit the hook's environment (#169).
+	// Export it so every config.Load* call below sees the plugin layer.
+	if flags.PluginConfig != "" {
+		_ = os.Setenv("SNIP_PLUGIN_CONFIG", flags.PluginConfig)
+	}
+
 	command := remaining[0]
 	cmdArgs := remaining[1:]
 
@@ -63,6 +71,15 @@ func Run(args []string) int {
 		}
 		if len(cmdArgs) > 0 && cmdArgs[0] == "pi" {
 			return runHookPi()
+		}
+		if len(cmdArgs) > 0 && cmdArgs[0] == "copilot" {
+			return runHookCopilot()
+		}
+		if len(cmdArgs) > 0 && cmdArgs[0] == "grok" {
+			return runHookGrok()
+		}
+		if len(cmdArgs) > 0 && cmdArgs[0] == "antigravity" {
+			return runHookAntigravity()
 		}
 		return runHook()
 
@@ -96,7 +113,7 @@ func Run(args []string) int {
 			return 1
 		}
 		defer func() { _ = tracker.Close() }()
-		if err := display.RunGain(tracker, cmdArgs); err != nil {
+		if err := display.RunGain(tracker, cfg.Economics, cmdArgs); err != nil {
 			display.PrintError(err.Error())
 			return 1
 		}
@@ -118,38 +135,14 @@ func Run(args []string) int {
 			return 1
 		}
 		defer func() { _ = tracker.Close() }()
-		if err := economics.Run(tracker, cmdArgs); err != nil {
+		if err := economics.Run(tracker, cfg.Economics, cmdArgs); err != nil {
 			display.PrintError(err.Error())
 			return 1
 		}
 		return 0
 
 	case "config":
-		cfg, err := config.Load()
-		if err != nil {
-			display.PrintError(err.Error())
-			return 1
-		}
-		fmt.Printf("tracking.db_path: %s\n", cfg.Tracking.DBPath)
-		fmt.Printf("filters.dir: %s\n", strings.Join(cfg.Filters.Dirs(), ", "))
-		fmt.Printf("tee.mode: %s\n", cfg.Tee.Mode)
-		fmt.Printf("tee.max_files: %d\n", cfg.Tee.MaxFiles)
-		fmt.Printf("display.color: %v\n", cfg.Display.Color)
-		fmt.Printf("display.emoji: %v\n", cfg.Display.Emoji)
-		fmt.Printf("display.quiet_no_filter: %v\n", cfg.Display.QuietNoFilter)
-		if len(cfg.Filters.Enable) == 0 {
-			fmt.Println("filters.enable: (all enabled)")
-		} else {
-			names := make([]string, 0, len(cfg.Filters.Enable))
-			for k := range cfg.Filters.Enable {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			for _, name := range names {
-				fmt.Printf("filters.enable.%s: %v\n", name, cfg.Filters.Enable[name])
-			}
-		}
-		return 0
+		return runConfigCmd()
 
 	case "discover":
 		if err := discover.Run(cmdArgs); err != nil {
@@ -167,6 +160,9 @@ func Run(args []string) int {
 
 	case "verify":
 		return verify.Run(cmdArgs)
+
+	case "inspect":
+		return inspect.Run(cmdArgs)
 
 	case "trust":
 		return runTrust(cmdArgs)
@@ -199,7 +195,11 @@ func Run(args []string) int {
 		return runCheck(targetCmd, targetArgs, flags)
 
 	case "proxy":
-		// Direct passthrough without filtering
+		// Direct passthrough without filtering. The "--" separator is
+		// optional (unlike run/check) to keep "snip proxy <cmd>" working.
+		if len(cmdArgs) > 0 && cmdArgs[0] == "--" {
+			cmdArgs = cmdArgs[1:]
+		}
 		if len(cmdArgs) == 0 {
 			display.PrintError("proxy requires a command argument")
 			return 1
@@ -236,23 +236,24 @@ func parseSeparatorArgs(args []string, cmdName string) (string, []string, string
 // runHook handles the "snip hook" subcommand for Claude Code PreToolUse.
 // Always returns 0 (graceful degradation).
 func runHook() int {
-	snipBin, commands, ok := loadHookContext()
+	snipBin, commands, prefixes, ok := loadHookContext()
 	if !ok {
 		return 0
 	}
-	_ = hook.Run(os.Stdin, os.Stdout, commands, snipBin)
+	_ = hook.Run(os.Stdin, os.Stdout, commands, prefixes, snipBin)
 	return 0
 }
 
 // runHookCodex handles "snip hook codex" — Codex's PreToolUse hook entry.
-// Codex cannot rewrite the command in place, so the handler responds with
-// a deny + suggested rewrite. Always returns 0 (graceful degradation).
+// Fully attestable commands are rewritten through updatedInput and allowed;
+// mixed or unverifiable commands pass through unchanged. Always returns 0
+// (graceful degradation).
 func runHookCodex() int {
-	snipBin, commands, ok := loadHookContext()
+	snipBin, commands, prefixes, ok := loadHookContext()
 	if !ok {
 		return 0
 	}
-	_ = hook.RunCodex(os.Stdin, os.Stdout, commands, snipBin)
+	_ = hook.RunCodex(os.Stdin, os.Stdout, commands, prefixes, snipBin)
 	return 0
 }
 
@@ -261,42 +262,94 @@ func runHookCodex() int {
 // which mirrors Claude Code's hookSpecificOutput format. Always returns 0
 // (graceful degradation).
 func runHookPi() int {
-	snipBin, commands, ok := loadHookContext()
+	snipBin, commands, prefixes, ok := loadHookContext()
 	if !ok {
 		return 0
 	}
-	_ = hook.RunPi(os.Stdin, os.Stdout, commands, snipBin)
+	_ = hook.RunPi(os.Stdin, os.Stdout, commands, prefixes, snipBin)
+	return 0
+}
+
+// runHookCopilot handles "snip hook copilot" — the GitHub Copilot CLI / VS Code
+// PreToolUse hook entry. It parses both the VS Code object shape (tool_input)
+// and the Copilot CLI toolArgs shape (an object, or a JSON-encoded string), and
+// emits the response envelope the detected host expects: hookSpecificOutput
+// (rewrite in updatedInput) for the VS Code object shape, or a flat object whose
+// rewrite lives in modifiedArgs for the Copilot CLI shape.
+// Always returns 0 (graceful degradation).
+func runHookCopilot() int {
+	snipBin, commands, prefixes, ok := loadHookContext()
+	if !ok {
+		return 0
+	}
+	_ = hook.RunCopilot(os.Stdin, os.Stdout, commands, prefixes, snipBin)
+	return 0
+}
+
+// grokDenyExitCode is the exit code Grok Build requires for a PreToolUse deny
+// to take effect (exit 0 allows; anything else but 2 is fail-open).
+const grokDenyExitCode = 2
+
+// runHookGrok handles "snip hook grok" — Grok Build's PreToolUse hook entry.
+// Grok Build cannot rewrite the command in place, so the handler responds with
+// a deny + suggested rewrite; the deny only takes effect with exit code 2.
+// Every other path returns 0 (graceful degradation: Grok Build hooks are
+// fail-open, so the command runs unfiltered).
+func runHookGrok() int {
+	snipBin, commands, prefixes, ok := loadHookContext()
+	if !ok {
+		return 0
+	}
+	denied, _ := hook.RunGrok(os.Stdin, os.Stdout, commands, prefixes, snipBin)
+	if denied {
+		return grokDenyExitCode
+	}
+	return 0
+}
+
+// runHookAntigravity handles the "snip hook" subcommand for Antigravity PreToolUse.
+// Always returns 0 (graceful degradation).
+func runHookAntigravity() int {
+	snipBin, commands, prefixes, ok := loadHookContext()
+	if !ok {
+		return 0
+	}
+	_ = hook.RunAntigravity(os.Stdin, os.Stdout, commands, prefixes, snipBin)
 	return 0
 }
 
 // loadHookContext resolves the snip binary path and loads the filter
 // registry. Returns ok=false on any failure so callers can exit 0 silently.
-func loadHookContext() (snipBin string, commands []string, ok bool) {
+func loadHookContext() (snipBin string, commands []string, prefixes []hook.TransparentPrefix, ok bool) {
 	bin, err := os.Executable()
 	if err != nil {
-		return "", nil, false
+		return "", nil, nil, false
 	}
 	bin, err = filepath.EvalSymlinks(bin)
 	if err != nil {
-		return "", nil, false
+		return "", nil, nil, false
 	}
 	bin, err = filepath.Abs(bin)
 	if err != nil {
-		return "", nil, false
+		return "", nil, nil, false
 	}
 
-	cfg, err := config.Load()
+	// Plugin layer included: a filter shipped by an agent plugin must be
+	// visible here, or its commands would never be rewritten. Project
+	// configs stay out of the hook path (no directory walk-up).
+	cfg, err := config.LoadWithPlugin()
 	if err != nil {
 		cfg = config.DefaultConfig()
 	}
 
 	filters, err := filter.LoadAll(cfg.Filters.Dirs())
 	if err != nil {
-		return "", nil, false
+		return "", nil, nil, false
 	}
 
 	registry := filter.NewRegistry(filters)
-	return bin, registry.Commands(), true
+	prefixes = hook.MergeTransparentPrefixes(cfg.Filters.TransparentPrefixes)
+	return bin, registry.Commands(), prefixes, true
 }
 
 func runPipeline(command string, args []string, flags Flags) int {
@@ -308,7 +361,19 @@ func runPipeline(command string, args []string, flags Flags) int {
 		cfg = config.DefaultConfig()
 	}
 
-	filters, err := filter.LoadAll(cfg.Filters.Dirs())
+	// Load merged plugin+user+project config for filter overrides, bypass,
+	// and global limits. Gracefully defaults to user-only if no plugin or
+	// .snip/config.toml exists.
+	projectCfg, err := config.LoadMerged()
+	if err != nil && flags.Verbose > 0 {
+		fmt.Fprintf(os.Stderr, "snip: project config error: %v\n", err)
+	}
+	if projectCfg == nil {
+		projectCfg = cfg
+	}
+
+	// Merged dirs so plugin-shipped filters load too (plugin < user by name).
+	filters, err := filter.LoadAll(projectCfg.Filters.Dirs())
 	if err != nil {
 		display.PrintError(fmt.Sprintf("load filters: %v", err))
 		return 1
@@ -329,15 +394,19 @@ func runPipeline(command string, args []string, flags Flags) int {
 	teeCfg.Mode = cfg.Tee.Mode
 	teeCfg.MaxFiles = cfg.Tee.MaxFiles
 	teeCfg.MaxFileSize = cfg.Tee.MaxFileSize
+	teeCfg.ProjectMarker = cfg.Tee.ProjectMarker
 
 	pipeline := &engine.Pipeline{
-		Registry:      registry,
-		Tracker:       tracker,
-		TeeConfig:     teeCfg,
-		Verbose:       flags.Verbose,
-		UltraCompact:  flags.UltraCompact,
-		QuietNoFilter: cfg.Display.QuietNoFilter,
-		FilterEnabled: cfg.Filters.Enable,
+		Registry:            registry,
+		Tracker:             tracker,
+		TeeConfig:           teeCfg,
+		Verbose:             flags.Verbose,
+		UltraCompact:        flags.UltraCompact,
+		QuietNoFilter:       cfg.Display.QuietNoFilter,
+		FilterEnabled:       projectCfg.Filters.Enable,
+		Config:              projectCfg,
+		TransparentPrefixes: hook.MergeTransparentPrefixes(projectCfg.Filters.TransparentPrefixes),
+		TrackUnfiltered:     cfg.Tracking.TrackUnfiltered,
 	}
 
 	return pipeline.Run(command, args)
@@ -399,6 +468,131 @@ func isFilterEnabled(cfg *config.Config, name string) bool {
 	return enabled
 }
 
+// runConfigCmd prints the effective merged configuration (plugin < user <
+// project) and labels where each layer came from (issue #161).
+func runConfigCmd() int {
+	cfg, sources, err := config.LoadMergedWithSources()
+	if err != nil {
+		display.PrintError(err.Error())
+		return 1
+	}
+
+	fmt.Println("sources:")
+	if len(sources) == 0 {
+		fmt.Println("  (built-in defaults only)")
+	}
+	for _, s := range sources {
+		status := "applied"
+		if !s.Applied {
+			status = "ignored: " + s.Reason
+		}
+		fmt.Printf("  %s: %s (%s)\n", s.Layer, s.Path, status)
+	}
+	fmt.Println()
+
+	mode := cfg.Mode
+	if mode == "" {
+		mode = "user"
+	}
+	fmt.Printf("mode: %s\n", mode)
+	fmt.Printf("tracking.db_path: %s\n", cfg.Tracking.DBPath)
+	fmt.Printf("tracking.track_unfiltered: %v\n", cfg.Tracking.TrackUnfiltered)
+	fmt.Printf("display.color: %v\n", cfg.Display.Color)
+	fmt.Printf("display.emoji: %v\n", cfg.Display.Emoji)
+	fmt.Printf("display.quiet_no_filter: %v\n", cfg.Display.QuietNoFilter)
+	fmt.Printf("display.summary: %v\n", cfg.Display.Summary)
+	fmt.Printf("filters.dir: %s\n", strings.Join(cfg.Filters.Dirs(), ", "))
+	if len(cfg.Filters.Enable) == 0 {
+		fmt.Println("filters.enable: (all enabled)")
+	} else {
+		names := make([]string, 0, len(cfg.Filters.Enable))
+		for k := range cfg.Filters.Enable {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Printf("filters.enable.%s: %v\n", name, cfg.Filters.Enable[name])
+		}
+	}
+	fmt.Printf("filters.global.max_lines: %d\n", cfg.Filters.Global.MaxLines)
+	fmt.Printf("filters.global.max_line_length: %d\n", cfg.Filters.Global.MaxLineLength)
+	fmt.Printf("filters.global.max_output_bytes: %d\n", cfg.Filters.Global.MaxOutputBytes)
+	if len(cfg.Filters.Override) > 0 {
+		names := make([]string, 0, len(cfg.Filters.Override))
+		for k := range cfg.Filters.Override {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Printf("filters.override.%s: %s\n", name, overrideSummary(cfg.Filters.Override[name]))
+		}
+	}
+	fmt.Printf("filters.bypass.commands: %s\n", listOrNone(cfg.Filters.Bypass.Commands))
+	// Built-in prefixes (uv run, poetry run, ...) always apply on top of the
+	// configured ones, so "(none)" alone would misstate effective behavior.
+	if len(cfg.Filters.TransparentPrefixes) == 0 {
+		fmt.Println("filters.transparent_prefixes: (none configured; built-ins always apply)")
+	} else {
+		fmt.Printf("filters.transparent_prefixes: %s (+ built-ins)\n", strings.Join(cfg.Filters.TransparentPrefixes, ", "))
+	}
+	fmt.Printf("tee.enabled: %v\n", cfg.Tee.Enabled)
+	fmt.Printf("tee.mode: %s\n", cfg.Tee.Mode)
+	fmt.Printf("tee.max_files: %d\n", cfg.Tee.MaxFiles)
+	fmt.Printf("tee.max_file_size: %d\n", cfg.Tee.MaxFileSize)
+	fmt.Printf("tee.project_marker: %s\n", cfg.Tee.ProjectMarker)
+	if len(cfg.Economics.Tiers) == 0 {
+		fmt.Println("economics.tiers: (built-in defaults)")
+	} else {
+		names := make([]string, 0, len(cfg.Economics.Tiers))
+		for k := range cfg.Economics.Tiers {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Printf("economics.tiers.%s: %g\n", name, cfg.Economics.Tiers[name])
+		}
+	}
+	return 0
+}
+
+// overrideSummary renders the non-zero fields of a filter override as
+// "key=value" pairs, in the field order of the TOML section.
+func overrideSummary(o config.FilterOverride) string {
+	var parts []string
+	if o.Head > 0 {
+		parts = append(parts, fmt.Sprintf("head=%d", o.Head))
+	}
+	if o.Tail > 0 {
+		parts = append(parts, fmt.Sprintf("tail=%d", o.Tail))
+	}
+	if o.TruncateLines > 0 {
+		parts = append(parts, fmt.Sprintf("truncate_lines=%d", o.TruncateLines))
+	}
+	// Regex values may contain spaces; quote them so field boundaries stay
+	// unambiguous.
+	if o.KeepLines != "" {
+		parts = append(parts, fmt.Sprintf("keep_lines=%q", o.KeepLines))
+	}
+	if o.RemoveLines != "" {
+		parts = append(parts, fmt.Sprintf("remove_lines=%q", o.RemoveLines))
+	}
+	if o.StreamMode != "" {
+		parts = append(parts, "stream_mode="+o.StreamMode)
+	}
+	if len(parts) == 0 {
+		return "(empty)"
+	}
+	return strings.Join(parts, " ")
+}
+
+// listOrNone joins values with commas, or "(none)" for an empty list.
+func listOrNone(values []string) string {
+	if len(values) == 0 {
+		return "(none)"
+	}
+	return strings.Join(values, ", ")
+}
+
 func printUsage() {
 	usage := `snip v%s — CLI Token Killer
 
@@ -419,12 +613,20 @@ Commands:
   config          Show current configuration
   trust           Trust project-local filter file(s) by SHA-256 hash
   untrust         Remove filter file(s) from the trust store
-  proxy           Passthrough without filtering
+  proxy           Passthrough without filtering (optional -- separator)
+  inspect         Code quality checks for snip's own source
+                  --dead-fields   find tagged struct fields never read
+                  --append-safety find shared-state append() calls
+                  --all           run both checks
+                  --json          output as JSON (for CI)
 
 Init flags:
   --agent <name>  Agent to configure:
                   claude-code (default), cursor, codex, pi, windsurf, cline,
-                  copilot, gemini, kilocode, antigravity
+                  copilot, gemini, kilocode, antigravity, grok
+  --mode <mode>   Integration mode for codex, copilot, grok:
+                  hook (default) or prompt (instructions-file injection
+                  for releases without PreToolUse hook support)
   --uninstall     Remove snip integration for the agent
 
 Flags:
@@ -477,6 +679,10 @@ func unproxyableReason(command string) string {
 		return "it must run in the parent shell to replace the current process"
 	case "exit", "logout", "return", "break", "continue":
 		return "it must run in the parent shell to control flow"
+	case "for", "while", "until", "select":
+		return "it is a shell keyword construct (use snip on individual commands inside the loop)"
+	case "if", "case", "fi", "esac", "then", "elif", "else", "do", "done":
+		return "it is a shell keyword construct (use snip on individual commands inside the block)"
 	case "wait", "bg", "fg", "disown", "jobs", "suspend":
 		return "it must run in the parent shell to access the job table"
 	case "bindkey", "bind", "complete", "compopt", "compinit", "zstyle", "autoload", "zmodload", "enable", "disable", "abbr", "functions", "hash", "trap", "umask", "ulimit":
