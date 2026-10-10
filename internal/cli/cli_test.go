@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/edouard-claude/snip/internal/trust"
 )
 
 // captureStderr captures stderr during fn execution and returns the captured output.
@@ -20,6 +22,30 @@ func captureStderr(fn func()) string {
 	var buf bytes.Buffer
 	_, _ = buf.ReadFrom(r)
 	return buf.String()
+}
+
+// captureStdout captures stdout during fn execution and returns the captured output.
+func captureStdout(fn func()) string {
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	fn()
+	_ = w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	return buf.String()
+}
+
+// TestUsageDocumentsInitFlags guards against init flags implemented in
+// initcmd but missing from the help text (issue #162).
+func TestUsageDocumentsInitFlags(t *testing.T) {
+	out := captureStdout(printUsage)
+	for _, flag := range []string{"--agent", "--mode", "--uninstall"} {
+		if !strings.Contains(out, flag) {
+			t.Errorf("printUsage does not document init flag %s", flag)
+		}
+	}
 }
 
 func TestUnproxyableCommands(t *testing.T) {
@@ -81,6 +107,21 @@ func TestUnproxyableCommands(t *testing.T) {
 		{"trap", true},
 		{"umask", true},
 		{"ulimit", true},
+		// Shell keyword constructs
+		{"for", true},
+		{"while", true},
+		{"until", true},
+		{"select", true},
+		{"if", true},
+		{"case", true},
+		{"fi", true},
+		{"esac", true},
+		{"then", true},
+		{"elif", true},
+		{"else", true},
+		{"done", true},
+		{"do", true},
+		{"perform", false}, // contains "for" but isn't the keyword
 		{"git", false},
 		{"go", false},
 		{"docker", false},
@@ -164,6 +205,49 @@ func TestCheckRejectsArgsBeforeSeparator(t *testing.T) {
 	code := Run([]string{"snip", "check", "foo", "--", "bar"})
 	if code != 1 {
 		t.Errorf("expected exit code 1, got %d", code)
+	}
+}
+
+func TestProxyAcceptsSeparator(t *testing.T) {
+	code := Run([]string{"snip", "proxy", "--", "true"})
+	if code != 0 {
+		t.Errorf("Run(proxy -- true) = %d, want 0", code)
+	}
+}
+
+func TestProxyPreservesExitCodeWithSeparator(t *testing.T) {
+	// Distinctive exit code: 1 would collide with snip's own error return.
+	code := Run([]string{"snip", "proxy", "--", "sh", "-c", "exit 3"})
+	if code != 3 {
+		t.Errorf("Run(proxy -- sh -c 'exit 3') = %d, want 3", code)
+	}
+}
+
+func TestProxyEmptyAfterSeparator(t *testing.T) {
+	var code int
+	stderr := captureStderr(func() {
+		code = Run([]string{"snip", "proxy", "--"})
+	})
+	if code != 1 {
+		t.Errorf("Run(proxy --) = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "proxy requires a command argument") {
+		t.Errorf("expected usage error on stderr, got %q", stderr)
+	}
+}
+
+func TestProxyWithoutSeparator(t *testing.T) {
+	code := Run([]string{"snip", "proxy", "true"})
+	if code != 0 {
+		t.Errorf("Run(proxy true) = %d, want 0", code)
+	}
+}
+
+func TestProxyKeepsNonLeadingSeparator(t *testing.T) {
+	// Only a leading "--" is stripped; a later one belongs to the child.
+	code := Run([]string{"snip", "proxy", "sh", "-c", `test "$1" = "--"`, "_", "--"})
+	if code != 0 {
+		t.Errorf("Run(proxy sh -c 'test $1 = --' _ --) = %d, want 0", code)
 	}
 }
 
@@ -882,5 +966,200 @@ func TestRunCommandHelpAfterSeparator(t *testing.T) {
 	code := Run([]string{"snip", "run", "--", "git", "--help"})
 	if code != 0 {
 		t.Errorf("Run(run -- git --help) = %d, want 0", code)
+	}
+}
+
+// TestConfigShowsMergedConfig verifies that `snip config` prints the
+// effective merged configuration with its layer sources (issue #161).
+func TestConfigShowsMergedConfig(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(home, ".config", "snip", "filters"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	userPath := filepath.Join(home, ".config", "snip", "config.toml")
+	userContent := `[filters]
+transparent_prefixes = ["poetry run"]
+
+[filters.global]
+max_lines = 100
+`
+	if err := os.WriteFile(userPath, []byte(userContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectDir, ".snip"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectCfgPath := filepath.Join(projectDir, ".snip", "config.toml")
+	projectContent := `mode = "project"
+
+[filters.global]
+max_lines = 50
+
+[filters.override.pyright]
+stream_mode = "full"
+
+[filters.bypass]
+commands = ["terraform"]
+`
+	if err := os.WriteFile(projectCfgPath, []byte(projectContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := make(trust.Store)
+	hash, err := trust.HashFile(projectCfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store[projectCfgPath] = hash
+	if err := trust.SaveTo(store, filepath.Join(home, ".config", "snip", "trusted.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("SNIP_CONFIG", userPath)
+	t.Setenv("SNIP_PLUGIN_CONFIG", "")
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	var buf bytes.Buffer
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	code := Run([]string{"snip", "config"})
+	_ = w.Close()
+	os.Stdout = old
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	out := buf.String()
+
+	if code != 0 {
+		t.Fatalf("Run(config) = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"mode: project",
+		"filters.global.max_lines: 50",
+		"filters.override.pyright: stream_mode=full",
+		"filters.bypass.commands: terraform",
+		"filters.transparent_prefixes: poetry run",
+		"tee.enabled: true",
+		"tee.max_file_size: 1048576",
+		"user: " + userPath,
+		"project: " + projectCfgPath,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q\noutput:\n%s", want, out)
+		}
+	}
+}
+
+func TestVersion(t *testing.T) {
+	v := Version()
+	if v == "" {
+		t.Error("Version() should not return empty string")
+	}
+}
+
+func TestBuildCommandString(t *testing.T) {
+	tests := []struct {
+		command string
+		args    []string
+		want    string
+	}{
+		{"git", nil, "git"},
+		{"git", []string{}, "git"},
+		{"git", []string{"log", "-10"}, "git log -10"},
+		{"docker", []string{"ps", "-a"}, "docker ps -a"},
+	}
+	for _, tt := range tests {
+		got := BuildCommandString(tt.command, tt.args)
+		if got != tt.want {
+			t.Errorf("BuildCommandString(%q, %v) = %q, want %q", tt.command, tt.args, got, tt.want)
+		}
+	}
+}
+
+func TestRunTrustWithFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Create a YAML filter file to trust.
+	dir := t.TempDir()
+	filterPath := filepath.Join(dir, "filter.yaml")
+	if err := os.WriteFile(filterPath, []byte("name: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runTrust([]string{filterPath})
+	if code != 0 {
+		t.Errorf("runTrust: expected exit 0, got %d", code)
+	}
+}
+
+func TestRunUntrustWithFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Trust a file first.
+	dir := t.TempDir()
+	filterPath := filepath.Join(dir, "filter.yaml")
+	if err := os.WriteFile(filterPath, []byte("name: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runTrust([]string{filterPath})
+	if code != 0 {
+		t.Fatalf("runTrust: %d", code)
+	}
+
+	// Now untrust it.
+	code = runUntrust([]string{filterPath})
+	if code != 0 {
+		t.Errorf("runUntrust: expected exit 0, got %d", code)
+	}
+}
+
+func TestRunTrustWithDir(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "test.yaml"), []byte("name: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runTrust([]string{dir})
+	if code != 0 {
+		t.Errorf("runTrust with dir: expected exit 0, got %d", code)
+	}
+}
+
+func TestRunTrustWithEmptyDir(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	dir := t.TempDir()
+	// Empty directory — no YAML files, so runTrust should fail.
+	code := runTrust([]string{dir})
+	if code != 1 {
+		t.Errorf("runTrust with empty dir: expected exit 1, got %d", code)
+	}
+}
+
+func TestRunTrustNonexistent(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	code := runTrust([]string{"/nonexistent/file.yaml"})
+	if code != 1 {
+		t.Errorf("runTrust nonexistent: expected exit 1, got %d", code)
 	}
 }

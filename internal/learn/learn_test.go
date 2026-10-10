@@ -1,6 +1,8 @@
 package learn
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -457,6 +459,20 @@ func TestExtractBaseCommand(t *testing.T) {
 		{"CGO_ENABLED=0 go build", "go"},
 		{"/usr/bin/git status", "git"},
 		{"npm install", "npm"},
+		// Navigation prefixes and standalone assignments hide the real command.
+		{"cd /Users/e/app && npx react-native run-ios", "npx"},
+		{"cd ~/Code/app && sed -i '' 's|a|b|' f.yaml", "sed"},
+		{"SCRATCH=/tmp/x/scratchpad && python3 -c 'print(1)'", "python3"},
+		{"SP=/tmp/y/scratchpad; git diff --stat", "git"},
+		{"cd /tmp && gh pr view 18 --repo o/r", "gh"},
+		{"pushd /tmp && make build", "make"},
+		{"git log | grep x", "git"},
+		{"cd /tmp", "cd"},
+		{"SP=/tmp/x/scratchpad\npython3 - <<'PY'\nimport io\nPY", "python3"},
+		{"go test ./... 2>&1 | tail -3", "go"},
+		{"TOKEN=$(cat /tmp/jwt.txt) && curl -s http://x", "curl"},
+		{"SP=/tmp/x; TOKEN=$(cat $SP/jwt.txt)", ""},
+		{"", ""},
 	}
 
 	for _, tt := range tests {
@@ -507,6 +523,137 @@ func TestStringOrArrayUnmarshal(t *testing.T) {
 	}
 }
 
+func TestCwdToProjectName(t *testing.T) {
+	tests := []struct {
+		name string
+		cwd  string
+		want string
+	}{
+		{
+			name: "unix path",
+			cwd:  "/Users/edouard/Code/go/snip",
+			want: "-Users-edouard-Code-go-snip",
+		},
+		{
+			name: "windows drive colon and dashes in project dir",
+			cwd:  `C:\dev\acme\agentic-acme-polishing`,
+			want: "C--dev-acme-agentic-acme-polishing",
+		},
+		{
+			name: "windows path with underscore and space",
+			cwd:  `C:\dev\_lab\my project`,
+			want: "C--dev--lab-my-project",
+		},
+		{
+			name: "windows home dir with whitespace and dot dir",
+			cwd:  `C:\Users\Jane Doe\.claude`,
+			want: "C--Users-Jane-Doe--claude",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cwdToProjectName(tt.cwd); got != tt.want {
+				t.Errorf("cwdToProjectName(%q) = %q, want %q", tt.cwd, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindProjectDirsRespectsClaudeConfigDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	t.Chdir(t.TempDir())
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectDir := filepath.Join(claudeDir, "projects", cwdToProjectName(cwd))
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dirs, err := findProjectDirs(Options{})
+	if err != nil {
+		t.Fatalf("findProjectDirs: %v", err)
+	}
+	if len(dirs) != 1 || dirs[0] != projectDir {
+		t.Errorf("findProjectDirs() = %v, want [%s]", dirs, projectDir)
+	}
+}
+
+func TestRunWithData(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	cwd, _ := os.Getwd()
+	projectDir := filepath.Join(tmpHome, ".claude", "projects", cwdToProjectName(cwd))
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionFile := filepath.Join(projectDir, "session.jsonl")
+	writeLines(t, sessionFile, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"git status"}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"error: command not found","is_error":true}]},"timestamp":"2026-04-01T10:00:05.000Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"git branch"}}]},"timestamp":"2026-04-01T10:00:10.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"* main"}]},"timestamp":"2026-04-01T10:00:15.000Z"}`,
+	})
+
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	err := Run([]string{"--since", "365"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stderr = old
+}
+
+func TestRunGenerate(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	cwd, _ := os.Getwd()
+	projectDir := filepath.Join(tmpHome, ".claude", "projects", cwdToProjectName(cwd))
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionFile := filepath.Join(projectDir, "session.jsonl")
+	writeLines(t, sessionFile, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"git status"}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"error: command not found","is_error":true}]},"timestamp":"2026-04-01T10:00:05.000Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"git branch"}}]},"timestamp":"2026-04-01T10:00:10.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"* main"}]},"timestamp":"2026-04-01T10:00:15.000Z"}`,
+	})
+
+	// Clean up the rules file that generateRules creates in CWD.
+	ruleFile := filepath.Join(".claude", "rules", "cli-corrections.md")
+	t.Cleanup(func() { _ = os.RemoveAll(ruleFile) })
+
+	// Capture stdout for the print result
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := Run([]string{"--since", "365", "--generate"})
+	if err != nil {
+		t.Fatalf("Run --generate: %v", err)
+	}
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stdout = old
+}
+
 func writeLines(t *testing.T, path string, lines []string) {
 	t.Helper()
 	data := ""
@@ -515,5 +662,132 @@ func writeLines(t *testing.T, path string, lines []string) {
 	}
 	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExtractCommandEntriesTrustsExplicitFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+
+	// The output quotes an error marker, but the tool reported success.
+	writeLines(t, path, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"grep -n \"undefined:\" main.go"}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"12: // undefined: reflect","is_error":false}]},"timestamp":"2026-04-01T10:00:05.000Z"}`,
+	})
+
+	entries := extractCommandEntries(path, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].IsError {
+		t.Error("entries[0].IsError = true, want false: an explicit is_error:false must win over the output heuristic")
+	}
+}
+
+func TestExtractCommandEntriesFallsBackWithoutFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+
+	// No is_error field at all: the output heuristic is the only signal left.
+	writeLines(t, path, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"foo --bar"}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"foo: command not found"}]},"timestamp":"2026-04-01T10:00:05.000Z"}`,
+	})
+
+	entries := extractCommandEntries(path, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if !entries[0].IsError {
+		t.Error("entries[0].IsError = false, want true")
+	}
+}
+
+func TestExtractCommandEntriesDropsRejections(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+
+	// A rejected command never ran: it is neither a failure nor a fix.
+	writeLines(t, path, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"go test ./..."}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"The user doesn't want to proceed with this tool use. The tool use was rejected (e.g. if it was a file edit).","is_error":true}]},"timestamp":"2026-04-01T10:00:05.000Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"go build ./..."}}]},"timestamp":"2026-04-01T10:00:10.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"ok"}]},"timestamp":"2026-04-01T10:00:15.000Z"}`,
+	})
+
+	entries := extractCommandEntries(path, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	if len(entries) != 1 {
+		t.Fatalf("expected the rejected command to be dropped, got %d entries", len(entries))
+	}
+	if entries[0].Command != "go build ./..." {
+		t.Errorf("entries[0].Command = %q, want %q", entries[0].Command, "go build ./...")
+	}
+	if patterns := detectPatterns(entries); len(patterns) != 0 {
+		t.Errorf("expected no pattern from a rejection, got %d", len(patterns))
+	}
+}
+
+func TestPrintResultEmpty(t *testing.T) {
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	printResult(Result{})
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stdout = old
+
+	output := buf.String()
+	if !strings.Contains(output, "No error-correction patterns found") {
+		t.Error("expected 'No error-correction patterns found' message")
+	}
+}
+
+func TestPrintResultWithData(t *testing.T) {
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	printResult(Result{
+		SessionsScanned: 5,
+		TotalErrors:     3,
+		Groups: []PatternGroup{
+			{
+				BaseCommand: "go",
+				TotalCount:  2,
+				Patterns: []ErrorPattern{
+					{
+						BaseCommand:  "go",
+						ErrorCommand: "go tes ./...",
+						ErrorOutput:  "go: unknown subcommand",
+						FixCommand:   "go test ./...",
+					},
+				},
+			},
+		},
+	})
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	os.Stdout = old
+
+	output := buf.String()
+	if !strings.Contains(output, "Scanned: 5 sessions") {
+		t.Error("expected session count")
+	}
+	if !strings.Contains(output, "3 errors with corrections") {
+		t.Error("expected error count")
+	}
+	if !strings.Contains(output, "Common patterns") {
+		t.Error("expected 'Common patterns' section")
+	}
+	if !strings.Contains(output, "go") {
+		t.Error("expected 'go' base command")
+	}
+	if !strings.Contains(output, "2 occurrences") {
+		t.Error("expected '2 occurrences'")
 	}
 }

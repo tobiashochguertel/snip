@@ -9,6 +9,10 @@ type Flags struct {
 	SkipEnv      bool
 	Version      bool
 	Help         bool
+	// PluginConfig is the --plugin-config value: a plugin-provided snip
+	// config path embedded in rewritten commands by the hook (issue #169).
+	// Applied by exporting SNIP_PLUGIN_CONFIG before config loading.
+	PluginConfig string
 }
 
 // ParseFlags extracts global flags from args and returns remaining args.
@@ -19,13 +23,23 @@ func ParseFlags(args []string) (Flags, []string) {
 	var flags Flags
 	var remaining []string
 
+	skipNext := false
 	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
 		if arg == "--" {
 			// Everything after "--" belongs to the underlying command.
 			remaining = append(remaining, args[i+1:]...)
 			break
 		}
 		switch {
+		case arg == "--plugin-config" && i+1 < len(args):
+			flags.PluginConfig = args[i+1]
+			skipNext = true
+		case arg == "--plugin-config":
+			// Missing value: ignore the dangling flag.
 		case arg == "-vv":
 			flags.Verbose = 2
 		case arg == "-v":
@@ -64,7 +78,7 @@ func isStackedVerboseFlag(arg string) bool {
 
 func isBuiltInCommand(arg string) bool {
 	switch arg {
-	case "run", "check", "init", "gain", "cc-economics", "config", "proxy", "hook", "hook-audit", "discover", "learn", "verify", "trust", "untrust":
+	case "run", "check", "init", "gain", "cc-economics", "config", "proxy", "hook", "hook-audit", "discover", "learn", "verify", "trust", "untrust", "inspect":
 		return true
 	default:
 		return false

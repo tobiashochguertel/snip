@@ -266,10 +266,38 @@ func TestMapToStats(t *testing.T) {
 }
 
 func TestCwdToProjectName(t *testing.T) {
-	got := cwdToProjectName("/Users/edouard/Code/go/snip")
-	want := "-Users-edouard-Code-go-snip"
-	if got != want {
-		t.Errorf("cwdToProjectName() = %q, want %q", got, want)
+	tests := []struct {
+		name string
+		cwd  string
+		want string
+	}{
+		{
+			name: "unix path",
+			cwd:  "/Users/edouard/Code/go/snip",
+			want: "-Users-edouard-Code-go-snip",
+		},
+		{
+			name: "windows drive colon and dashes in project dir",
+			cwd:  `C:\dev\acme\agentic-acme-polishing`,
+			want: "C--dev-acme-agentic-acme-polishing",
+		},
+		{
+			name: "windows path with underscore and space",
+			cwd:  `C:\dev\_lab\my project`,
+			want: "C--dev--lab-my-project",
+		},
+		{
+			name: "windows home dir with whitespace and dot dir",
+			cwd:  `C:\Users\Jane Doe\.claude`,
+			want: "C--Users-Jane-Doe--claude",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cwdToProjectName(tt.cwd); got != tt.want {
+				t.Errorf("cwdToProjectName(%q) = %q, want %q", tt.cwd, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -409,6 +437,30 @@ func TestPrintResultTruncatesLongNames(t *testing.T) {
 	}
 }
 
+func TestFindProjectDirsRespectsClaudeConfigDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	t.Chdir(t.TempDir())
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectDir := filepath.Join(claudeDir, "projects", cwdToProjectName(cwd))
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dirs, err := findProjectDirs(Options{})
+	if err != nil {
+		t.Fatalf("findProjectDirs: %v", err)
+	}
+	if len(dirs) != 1 || dirs[0] != projectDir {
+		t.Errorf("findProjectDirs() = %v, want [%s]", dirs, projectDir)
+	}
+}
+
 func writeLines(t *testing.T, path string, lines []string) {
 	t.Helper()
 	data := ""
@@ -417,5 +469,51 @@ func writeLines(t *testing.T, path string, lines []string) {
 	}
 	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunWithSessionData(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Create a Claude Code project dir with session files.
+	cwd, _ := os.Getwd()
+	projectDir := filepath.Join(tmpHome, ".claude", "projects", cwdToProjectName(cwd))
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create session file with Bash commands.
+	sessionFile := filepath.Join(projectDir, "session.jsonl")
+	writeLines(t, sessionFile, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}]},"timestamp":"2026-04-01T10:01:00.000Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cat file.txt"}}]},"timestamp":"2026-04-01T10:02:00.000Z"}`,
+	})
+
+	err := Run(nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestRunWithSince(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	cwd, _ := os.Getwd()
+	projectDir := filepath.Join(tmpHome, ".claude", "projects", cwdToProjectName(cwd))
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionFile := filepath.Join(projectDir, "session.jsonl")
+	writeLines(t, sessionFile, []string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]},"timestamp":"2026-04-01T10:00:00.000Z"}`,
+	})
+
+	err := Run([]string{"--since", "30"})
+	if err != nil {
+		t.Fatalf("Run --since: %v", err)
 	}
 }

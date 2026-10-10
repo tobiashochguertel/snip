@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+	"unicode/utf8"
 
 	"github.com/edouard-claude/snip/internal/utils"
 )
@@ -16,6 +17,7 @@ var actions = map[string]ActionFunc{
 	"keep_lines":      keepLines,
 	"remove_lines":    removeLines,
 	"truncate_lines":  truncateLines,
+	"truncate_bytes":  truncateBytes,
 	"strip_ansi":      stripANSI,
 	"head":            head,
 	"tail":            tail,
@@ -102,6 +104,7 @@ func keepLines(input ActionResult, params map[string]any) (ActionResult, error) 
 			out = append(out, line)
 		}
 	}
+	out = appendRemovedMsg(out, len(input.Lines)-len(out), params)
 	return ActionResult{Lines: out, Metadata: input.Metadata}, nil
 }
 
@@ -116,7 +119,19 @@ func removeLines(input ActionResult, params map[string]any) (ActionResult, error
 			out = append(out, line)
 		}
 	}
+	out = appendRemovedMsg(out, len(input.Lines)-len(out), params)
 	return ActionResult{Lines: out, Metadata: input.Metadata}, nil
+}
+
+// appendRemovedMsg announces lines dropped by keep_lines/remove_lines when the
+// filter sets removed_msg (a fmt format taking the count), so a filtered answer
+// is distinguishable from an empty one (#194).
+func appendRemovedMsg(out []string, removed int, params map[string]any) []string {
+	msg := getStr(params, "removed_msg")
+	if msg == "" || removed == 0 {
+		return out
+	}
+	return append(out, fmt.Sprintf(msg, removed))
 }
 
 func truncateLines(input ActionResult, params map[string]any) (ActionResult, error) {
@@ -139,6 +154,42 @@ func truncateLines(input ActionResult, params map[string]any) (ActionResult, err
 		}
 	}
 	return ActionResult{Lines: out, Metadata: input.Metadata}, nil
+}
+
+func truncateBytes(input ActionResult, params map[string]any) (ActionResult, error) {
+	max := getInt(params, "max", 0)
+	if max <= 0 {
+		return input, nil
+	}
+	joined := strings.Join(input.Lines, "\n")
+	if len(joined) <= max {
+		return input, nil
+	}
+	msg := getStr(params, "overflow_msg")
+	if msg == "" {
+		msg = fmt.Sprintf("... truncated at %d bytes", max)
+	}
+	// The marker is paid for out of the budget: max is a hard cap on the bytes
+	// we emit, so reserve len(msg) plus the newline that joins it before cutting.
+	budget := max - len(msg) - 1
+	if budget <= 0 {
+		// The marker alone does not fit; emitting it would blow the cap, so
+		// drop it and spend the whole budget on content.
+		budget = max
+		msg = ""
+	}
+	// Back off to a UTF-8 rune boundary so we never emit a partial rune.
+	cut := budget
+	for cut > 0 && !utf8.RuneStart(joined[cut]) {
+		cut--
+	}
+	// Split allocates a fresh slice, so the append never aliases input.Lines.
+	out := strings.Split(joined[:cut], "\n")
+	if msg != "" {
+		out = append(out, msg)
+	}
+	input.Lines = out
+	return input, nil
 }
 
 func stripANSI(input ActionResult, params map[string]any) (ActionResult, error) {
@@ -170,9 +221,14 @@ func tail(input ActionResult, params map[string]any) (ActionResult, error) {
 	if len(input.Lines) <= n {
 		return input, nil
 	}
-	start := len(input.Lines) - n
-	out := make([]string, n)
-	copy(out, input.Lines[start:])
+	dropped := len(input.Lines) - n
+	msg := getStr(params, "overflow_msg")
+	if msg == "" {
+		msg = fmt.Sprintf("+%d earlier lines", dropped)
+	}
+	out := make([]string, 0, n+1)
+	out = append(out, msg)
+	out = append(out, input.Lines[dropped:]...)
 	return ActionResult{Lines: out, Metadata: input.Metadata}, nil
 }
 
@@ -229,7 +285,8 @@ func groupBy(input ActionResult, params map[string]any) (ActionResult, error) {
 
 	// append mode: keep original lines and add group summary at the end
 	if getBool(params, "append") {
-		out = append(input.Lines, out...)
+		// safe because: fresh slice via append([]string{}, ...)
+		out = append(append([]string{}, input.Lines...), out...)
 	}
 
 	return ActionResult{Lines: out, Metadata: meta}, nil
@@ -617,7 +674,8 @@ func aggregate(input ActionResult, params map[string]any) (ActionResult, error) 
 
 	// append mode: keep original lines and add aggregate summary at the end
 	if getBool(params, "append") {
-		out = append(input.Lines, out...)
+		// safe because: fresh slice via append([]string{}, ...)
+		out = append(append([]string{}, input.Lines...), out...)
 	}
 
 	return ActionResult{Lines: out, Metadata: meta}, nil

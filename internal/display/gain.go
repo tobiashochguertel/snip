@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/edouard-claude/snip/internal/config"
 	"github.com/edouard-claude/snip/internal/tracking"
 	"github.com/edouard-claude/snip/internal/utils"
 )
 
-// RunGain executes the gain (token savings report) command.
-func RunGain(tracker *tracking.Tracker, args []string) error {
+// RunGain executes the gain (token savings report) command. ecoCfg supplies
+// the pricing tiers used by --quota, the same table cc-economics reports on
+// ([economics.tiers] in config.toml, or the built-in defaults).
+func RunGain(tracker *tracking.Tracker, ecoCfg config.EconomicsConfig, args []string) error {
 	if tracker == nil {
 		PrintError("no tracking data (run some commands first)")
 		return nil
@@ -19,17 +22,18 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 
 	// Parse args
 	var (
-		showDaily   bool
-		showWeekly  bool
-		showMonthly bool
-		showJSON    bool
-		showCSV     bool
-		showTop     bool
-		showQuota   bool
-		noTruncate  bool
-		historyN    int
-		topN        int
-		days        = 7
+		showDaily      bool
+		showWeekly     bool
+		showMonthly    bool
+		showJSON       bool
+		showCSV        bool
+		showTop        bool
+		showQuota      bool
+		showUnfiltered bool
+		noTruncate     bool
+		historyN       int
+		topN           int
+		days           = 7
 	)
 
 	for i := 0; i < len(args); i++ {
@@ -48,6 +52,15 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 			showQuota = true
 		case "--top":
 			showTop = true
+			if i+1 < len(args) {
+				_, _ = fmt.Sscanf(args[i+1], "%d", &topN)
+				i++
+			}
+			if topN <= 0 {
+				topN = 10
+			}
+		case "--unfiltered":
+			showUnfiltered = true
 			if i+1 < len(args) {
 				_, _ = fmt.Sscanf(args[i+1], "%d", &topN)
 				i++
@@ -80,6 +93,10 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 		return exportCSV(tracker, days)
 	}
 
+	if showUnfiltered {
+		return showUnfilteredCommands(tracker, topN, noTruncate)
+	}
+
 	if historyN > 0 {
 		return showHistory(tracker, historyN, noTruncate)
 	}
@@ -88,7 +105,7 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 		printSummary(summary)
 		err := showByCommand(tracker, topN, noTruncate)
 		if err == nil && showQuota {
-			printQuotaProjection(tracker)
+			printQuotaProjection(tracker, ecoCfg)
 		}
 		return err
 	}
@@ -97,7 +114,7 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 		printSummary(summary)
 		err := showPeriodReport(tracker, "weekly")
 		if err == nil && showQuota {
-			printQuotaProjection(tracker)
+			printQuotaProjection(tracker, ecoCfg)
 		}
 		return err
 	}
@@ -106,7 +123,7 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 		printSummary(summary)
 		err := showPeriodReport(tracker, "monthly")
 		if err == nil && showQuota {
-			printQuotaProjection(tracker)
+			printQuotaProjection(tracker, ecoCfg)
 		}
 		return err
 	}
@@ -114,7 +131,7 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 	if showDaily {
 		err := showDailyReport(tracker, days, summary)
 		if err == nil && showQuota {
-			printQuotaProjection(tracker)
+			printQuotaProjection(tracker, ecoCfg)
 		}
 		return err
 	}
@@ -125,7 +142,7 @@ func RunGain(tracker *tracking.Tracker, args []string) error {
 	_ = showByCommand(tracker, 10, noTruncate)
 
 	if showQuota {
-		printQuotaProjection(tracker)
+		printQuotaProjection(tracker, ecoCfg)
 	}
 
 	return nil
@@ -244,20 +261,64 @@ func showByCommand(tracker *tracking.Tracker, limit int, noTruncate bool) error 
 	return nil
 }
 
-// quotaTier holds a model tier name and its price per 1M input tokens.
-type quotaTier struct {
-	name   string
-	priceM float64
+// showUnfilteredCommands prints the most frequent commands that ran with no
+// matching filter at all — a guide to filter-coverage gaps (issue #96).
+func showUnfilteredCommands(tracker *tracking.Tracker, limit int, noTruncate bool) error {
+	stats, err := tracker.GetUnfiltered(limit)
+	if err != nil {
+		return err
+	}
+
+	tty := IsTerminal()
+	fmt.Println()
+	if tty {
+		fmt.Println(DimStyle.Render("  Unfiltered commands by frequency"))
+	} else {
+		fmt.Println("  Unfiltered commands by frequency")
+	}
+	fmt.Println()
+
+	if len(stats) == 0 {
+		hint := "  (none recorded — enable [tracking] track_unfiltered = true in config.toml)"
+		if tty {
+			fmt.Println(DimStyle.Render(hint))
+		} else {
+			fmt.Println(hint)
+		}
+		fmt.Println()
+		return nil
+	}
+
+	maxRuns := 0
+	for _, s := range stats {
+		if s.Count > maxRuns {
+			maxRuns = s.Count
+		}
+	}
+
+	headers := []string{"Command", "Runs", "Frequency", "Last seen"}
+	var rows [][]string
+	// Fixed columns: Runs(4) + Frequency(12) + Last seen(19) + 3×sep(6) = 41
+	maxCmd := cmdColWidth(TerminalWidth(), 41)
+	for _, s := range stats {
+		cmd := s.Command
+		if !noTruncate && len(cmd) > maxCmd {
+			cmd = cmd[:maxCmd-3] + "..."
+		}
+		rows = append(rows, []string{
+			cmd,
+			fmt.Sprintf("%d", s.Count),
+			ColorBar(s.Count, maxRuns, 12),
+			s.LastSeen,
+		})
+	}
+
+	fmt.Print(FormatTable(headers, rows))
+	fmt.Println()
+	return nil
 }
 
-// quotaTiers lists model tiers for the --quota projection.
-var quotaTiers = []quotaTier{
-	{"Haiku", 0.25},
-	{"Sonnet", 3.00},
-	{"Opus", 15.00},
-}
-
-func printQuotaProjection(tracker *tracking.Tracker) {
+func printQuotaProjection(tracker *tracking.Tracker, ecoCfg config.EconomicsConfig) {
 	daily, err := tracker.GetDaily(30)
 	if err != nil || len(daily) == 0 {
 		return
@@ -294,9 +355,16 @@ func printQuotaProjection(tracker *tracking.Tracker) {
 
 	printRow("Tokens saved/month", "~"+utils.FormatTokens(monthlySaved))
 
-	for _, tier := range quotaTiers {
-		cost := float64(monthlySaved) / 1_000_000 * tier.priceM
-		printRow(tier.name+" savings", formatQuotaCost(cost)+"/month")
+	for _, tier := range config.ActiveTiers(ecoCfg) {
+		cost := float64(monthlySaved) / 1_000_000 * tier.PriceM
+		printRow(tier.Name+" savings", formatQuotaCost(cost)+"/month")
+	}
+
+	assumption := "  Assumes saved tokens are input tokens (filtered output fed back to LLM context)."
+	if tty {
+		fmt.Println(DimStyle.Render(assumption))
+	} else {
+		fmt.Println(assumption)
 	}
 
 	fmt.Println()

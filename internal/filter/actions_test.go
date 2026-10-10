@@ -1,8 +1,10 @@
 package filter
 
 import (
+	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func lines(s ...string) ActionResult {
@@ -44,6 +46,37 @@ func TestRemoveLines(t *testing.T) {
 	}
 }
 
+func TestRemovedMsg(t *testing.T) {
+	input := lines("keep a", "drop 1", "keep b", "drop 2")
+	tests := []struct {
+		name   string
+		action ActionFunc
+		params map[string]any
+		want   []string
+	}{
+		{"remove_lines announces drops", removeLines,
+			map[string]any{"pattern": `^drop`, "removed_msg": "+%d dropped"},
+			[]string{"keep a", "keep b", "+2 dropped"}},
+		{"keep_lines announces drops", keepLines,
+			map[string]any{"pattern": `^keep`, "removed_msg": "+%d dropped"},
+			[]string{"keep a", "keep b", "+2 dropped"}},
+		{"silent when nothing dropped", removeLines,
+			map[string]any{"pattern": `^none`, "removed_msg": "+%d dropped"},
+			[]string{"keep a", "drop 1", "keep b", "drop 2"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := tt.action(input, tt.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(res.Lines, tt.want) {
+				t.Errorf("got %q, want %q", res.Lines, tt.want)
+			}
+		})
+	}
+}
+
 func TestTruncateLines(t *testing.T) {
 	input := lines("short", "this is a very long line that should be truncated at some point")
 	res, err := truncateLines(input, map[string]any{"max": 20, "ellipsis": "..."})
@@ -58,6 +91,116 @@ func TestTruncateLines(t *testing.T) {
 	}
 	if res.Lines[0] != "short" {
 		t.Errorf("short line modified: %q", res.Lines[0])
+	}
+}
+
+func TestTruncateBytesUTF8Boundary(t *testing.T) {
+	// "héllo" is h(1) é(2) l(1) l(1) o(1) = 6 bytes.
+	// Cutting at max=2 would land mid-rune through é (bytes 1-2).
+	// We must back off to byte 1 so we never emit invalid UTF-8.
+	input := lines("héllo")
+	res, err := truncateBytes(input, map[string]any{"max": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := strings.Join(res.Lines, "\n")
+	if !utf8.ValidString(out) {
+		t.Errorf("truncated output is not valid UTF-8: %q (% x)", out, out)
+	}
+	if res.Lines[0] != "h" {
+		t.Errorf("got %q, want %q", res.Lines[0], "h")
+	}
+}
+
+func TestTruncateBytesNoCut(t *testing.T) {
+	input := lines("short")
+	res, err := truncateBytes(input, map[string]any{"max": 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.Lines, "\n") != "short" {
+		t.Errorf("input mutated: %v", res.Lines)
+	}
+}
+
+func TestTruncateBytesEmoji(t *testing.T) {
+	// Emoji "🎉" is 4 bytes (F0 9F 8E 89). max=3 lands mid-emoji.
+	input := lines("ab🎉cd")
+	res, err := truncateBytes(input, map[string]any{"max": 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := strings.Join(res.Lines, "\n")
+	if !utf8.ValidString(out) {
+		t.Errorf("truncated output is not valid UTF-8: %q (% x)", out, out)
+	}
+	if res.Lines[0] != "ab" {
+		t.Errorf("got %q, want %q", res.Lines[0], "ab")
+	}
+}
+
+func TestTruncateBytesMarker(t *testing.T) {
+	const max = 70
+	original := []string{strings.Repeat("a", 40), strings.Repeat("b", 40)}
+	input := ActionResult{Lines: original, Metadata: nil}
+	res, err := truncateBytes(input, map[string]any{"max": max})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The kept bytes come first, the marker last, and the marker is paid for
+	// out of the budget: 44 kept bytes + "\n" + 25 marker bytes = 70.
+	want := []string{strings.Repeat("a", 40), strings.Repeat("b", 3), "... truncated at 70 bytes"}
+	if len(res.Lines) != len(want) {
+		t.Fatalf("got %v, want %v", res.Lines, want)
+	}
+	for i := range want {
+		if res.Lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, res.Lines[i], want[i])
+		}
+	}
+	if got := len(strings.Join(res.Lines, "\n")); got > max {
+		t.Errorf("output is %d bytes, over the %d-byte cap", got, max)
+	}
+	// Appending the marker must not write into the caller's backing array.
+	if original[1] != strings.Repeat("b", 40) {
+		t.Errorf("input slice mutated: %v", original)
+	}
+}
+
+func TestTruncateBytesCustomOverflowMsg(t *testing.T) {
+	const max = 20
+	input := lines("aaaaaaaaaa", "bbbbbbbbbb")
+	res, err := truncateBytes(input, map[string]any{"max": max, "overflow_msg": "[cut]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Lines[len(res.Lines)-1] != "[cut]" {
+		t.Errorf("custom overflow msg: %v", res.Lines)
+	}
+	if got := len(strings.Join(res.Lines, "\n")); got > max {
+		t.Errorf("output is %d bytes, over the %d-byte cap", got, max)
+	}
+}
+
+func TestTruncateBytesRespectsCap(t *testing.T) {
+	// Multi-byte input so rune-boundary back-off is exercised at every cap.
+	input := lines(
+		strings.Repeat("héllo wörld ", 20),
+		strings.Repeat("🎉 café ", 20),
+		strings.Repeat("naïve ", 20),
+	)
+	for _, max := range []int{1, 2, 3, 7, 24, 25, 26, 40, 100, 512, 4096} {
+		res, err := truncateBytes(input, map[string]any{"max": max})
+		if err != nil {
+			t.Fatalf("max=%d: %v", max, err)
+		}
+		out := strings.Join(res.Lines, "\n")
+		if len(out) > max {
+			t.Errorf("max=%d: output is %d bytes, over the cap: %q", max, len(out), out)
+		}
+		if !utf8.ValidString(out) {
+			t.Errorf("max=%d: output is not valid UTF-8: %q", max, out)
+		}
 	}
 }
 
@@ -104,11 +247,37 @@ func TestTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Lines) != 2 {
-		t.Errorf("got %d lines, want 2", len(res.Lines))
+	// overflow message + 2 lines
+	if len(res.Lines) != 3 {
+		t.Errorf("got %d lines, want 3", len(res.Lines))
 	}
-	if res.Lines[0] != "4" || res.Lines[1] != "5" {
+	if !strings.Contains(res.Lines[0], "+3 earlier") {
+		t.Errorf("overflow msg: %q", res.Lines[0])
+	}
+	if res.Lines[1] != "4" || res.Lines[2] != "5" {
 		t.Errorf("got %v", res.Lines)
+	}
+}
+
+func TestTailNoOverflow(t *testing.T) {
+	input := lines("1", "2", "3")
+	res, err := tail(input, map[string]any{"n": 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Lines) != 3 {
+		t.Errorf("got %d lines, want 3", len(res.Lines))
+	}
+}
+
+func TestTailCustomOverflowMsg(t *testing.T) {
+	input := lines("1", "2", "3", "4", "5")
+	res, err := tail(input, map[string]any{"n": 2, "overflow_msg": "[...]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Lines[0] != "[...]" {
+		t.Errorf("custom overflow msg: %q", res.Lines[0])
 	}
 }
 
@@ -151,6 +320,35 @@ func TestGroupByAppend(t *testing.T) {
 	// Group summary appended at the end
 	if !strings.HasPrefix(res.Lines[5], "go") {
 		t.Errorf("expected 'go' group, got %q", res.Lines[5])
+	}
+}
+
+func TestGroupByAppendAliasingIsolation(t *testing.T) {
+	// Verify that the backing array fix prevents mutation of the original
+	// input slice from leaking into the groupBy output.
+	original := []string{"a.go", "b.json", "c.go"}
+	copyForInput := make([]string, len(original))
+	copy(copyForInput, original)
+
+	input := ActionResult{Lines: copyForInput, Metadata: nil}
+	res, err := groupBy(input, map[string]any{
+		"pattern": `\.(\w+)$`,
+		"format":  "{{.Key}}: {{.Count}}",
+		"append":  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate the original backing array — should not affect result
+	copyForInput[0] = "CORRUPTED"
+	copyForInput[1] = "CORRUPTED"
+
+	// Original lines in result must still be intact
+	for i, want := range original {
+		if res.Lines[i] != want {
+			t.Errorf("backing array aliasing at line %d: got %q, want %q", i, res.Lines[i], want)
+		}
 	}
 }
 
@@ -220,6 +418,33 @@ func TestAggregateAppend(t *testing.T) {
 	}
 	if res.Lines[0] != "PASS foo" {
 		t.Errorf("first line should be original, got %q", res.Lines[0])
+	}
+}
+
+func TestAggregateAppendAliasingIsolation(t *testing.T) {
+	original := []string{"PASS a", "FAIL b", "PASS c"}
+	copyForInput := make([]string, len(original))
+	copy(copyForInput, original)
+
+	input := ActionResult{Lines: copyForInput, Metadata: nil}
+	res, err := aggregate(input, map[string]any{
+		"patterns": map[string]any{
+			"pass": `^PASS`,
+			"fail": `^FAIL`,
+		},
+		"append": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	copyForInput[0] = "CORRUPTED"
+	copyForInput[1] = "CORRUPTED"
+
+	for i, want := range original {
+		if res.Lines[i] != want {
+			t.Errorf("backing array aliasing at line %d: got %q, want %q", i, res.Lines[i], want)
+		}
 	}
 }
 
@@ -470,5 +695,53 @@ func TestGetAction(t *testing.T) {
 	}
 	if _, ok := GetAction("nonexistent"); ok {
 		t.Error("expected nonexistent action to not be found")
+	}
+}
+
+func TestJsonSchema(t *testing.T) {
+	input := lines(`{"name": "test", "version": 1, "nested": {"key": "value"}}`)
+	result, err := jsonSchema(input, map[string]any{"max_depth": 2})
+	if err != nil {
+		t.Fatalf("jsonSchema: %v", err)
+	}
+	output := strings.Join(result.Lines, "\n")
+	if !strings.Contains(output, "name") {
+		t.Error("expected schema to contain 'name'")
+	}
+	if !strings.Contains(output, "version") {
+		t.Error("expected schema to contain 'version'")
+	}
+	if !strings.Contains(output, "nested") {
+		t.Error("expected schema to contain 'nested'")
+	}
+}
+
+func TestJsonSchemaBadJSON(t *testing.T) {
+	input := lines("not json")
+	_, err := jsonSchema(input, nil)
+	if err == nil {
+		t.Fatal("expected error for bad JSON")
+	}
+}
+
+func TestToStringSlice(t *testing.T) {
+	// []string
+	if result, ok := toStringSlice([]string{"a", "b"}); !ok || len(result) != 2 {
+		t.Errorf("toStringSlice([]string) = %v, %v", result, ok)
+	}
+
+	// []any with strings
+	if result, ok := toStringSlice([]any{"a", "b"}); !ok || len(result) != 2 {
+		t.Errorf("toStringSlice([]any{strings}) = %v, %v", result, ok)
+	}
+
+	// []any with non-string
+	if _, ok := toStringSlice([]any{"a", 42}); ok {
+		t.Error("toStringSlice([]any{mixed}) should return false")
+	}
+
+	// non-slice
+	if _, ok := toStringSlice(42); ok {
+		t.Error("toStringSlice(int) should return false")
 	}
 }

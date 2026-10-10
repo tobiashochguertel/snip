@@ -15,16 +15,22 @@ The binary (snip) is the engine. Filters are data files. The two evolve independ
 ```
 cmd/snip/main.go        # Entry point
 embed.go                # Embedded default filters (go:embed)
-filters/*.yaml          # Declarative filter definitions (127 filters)
+filters/*.yaml          # Declarative filter definitions (132 filters)
 internal/
   cli/                  # CLI routing, flag parsing
   config/               # TOML config loading (~/.config/snip/config.toml)
   display/              # Lipgloss terminal styling, gain report
   engine/               # Command execution (goroutines), pipeline orchestration
-  filter/               # DSL types, 16 built-in actions, YAML parser, registry
+  filter/               # DSL types, 20 built-in actions, YAML parser, registry
   hook/                 # Claude Code PreToolUse hook handler (native Go, no bash/jq)
   initcmd/              # Multi-agent hook installation (Claude Code, Cursor, Codex, Windsurf, Cline)
   discover/             # Session history scanner for missed savings
+  learn/                # Scan session history for failed commands, generate CLI-correction rules
+  verify/               # Run the inline `tests:` blocks of filter YAML files
+  trust/                # SHA-256 trust store for user filter files (trust/untrust)
+  economics/            # Model pricing tiers, $ savings estimates (cc-economics)
+  hookaudit/            # Audit log of hook rewrite decisions (hook-audit)
+  inspect/              # Code quality checks on snip's own Go source
   tracking/             # SQLite token tracking (pure Go, no CGO)
   tee/                  # Raw output recovery on failure
   utils/                # Truncate, StripANSI, EstimateTokens, LazyRegex
@@ -55,12 +61,25 @@ make build               # Build static binary (CGO_ENABLED=0)
 make build-lite          # Build without SQLite tracking (-tags lite, ~5MB smaller)
 make test                # Run all tests with coverage
 make test-race           # Run tests with race detector
-make lint                # go vet + golangci-lint
-make install             # Install to $GOPATH/bin
+make lint                # go vet + golangci-lint (version pinned in .golangci-lint-version)
+make verify              # Run the inline `tests:` blocks of filters/*.yaml
+make vulncheck           # govulncheck ./...
+make ci                  # Pre-PR gate: test-race + verify + lint + vulncheck
+make install             # Install using GOBIN or the Go environment
 make install-lite        # Install lite variant
+make upgrade             # Replace active snip (GOBIN overrides)
+make upgrade-lite        # Replace active snip with lite variant
 go test -run TestName ./internal/filter/...   # Single test
 goreleaser release --snapshot --clean          # Test release build locally
 ```
+
+### Working in this repo
+
+- snip is usually installed as a hook here, so it filters `go` and `git` output while you work.
+  For raw output: `/usr/bin/git ...`, or `printf '#!/bin/sh\nexec go "$@"\n' > /tmp/rawgo && chmod +x /tmp/rawgo`
+- `snip verify` runs the **embedded** filter set: rebuild the binary after editing anything in `filters/`.
+  `make verify` goes through `go run`, so it always sees the current `filters/`
+- Filter inline `tests:` blocks are CI-enforced by the `Verify filters` step in `.github/workflows/ci.yaml`
 
 ## Design Constraints
 
@@ -76,6 +95,7 @@ goreleaser release --snapshot --clean          # Test release build locally
 ## Build Variants
 
 Two build modes via Go build tags:
+
 - **Full** (default): includes `modernc.org/sqlite` for token tracking via `internal/tracking/driver.go`
 - **Lite** (`-tags lite`): excludes SQLite, uses `driver_lite.go` stub — startup ~3ms faster
 
@@ -83,11 +103,23 @@ Tests requiring SQLite must have `//go:build !lite` tag. Check `tracking.DriverA
 
 ## Filter DSL
 
-Filters are declarative YAML files with 19 built-in actions:
-`keep_lines`, `remove_lines`, `truncate_lines`, `strip_ansi`, `head`, `tail`,
+Filters are declarative YAML files with 20 built-in actions:
+`keep_lines`, `remove_lines`, `truncate_lines`, `truncate_bytes`, `strip_ansi`, `head`, `tail`,
 `group_by`, `dedup`, `json_extract`, `json_schema`, `ndjson_stream`,
 `regex_extract`, `state_machine`, `aggregate`, `format_template`, `compact_path`,
 `replace`, `match_output`, `on_empty`
+
+Gotchas that have caused real bugs:
+
+- `aggregate` **replaces** the lines it counted unless `append: true` (caused #134, #136 in three filters)
+- `{{.count}}` is the number of lines reaching the template, not entities: wrong after any stage emitting a
+  summary, an overflow marker or a cap (caused #125). Prefer the tool's own count over recomputing one
+- Any stage that drops or counts lines must sit where payload and metadata are still distinguishable —
+  a `remove_lines` after a state machine will happily delete panic text
+- `exclude_flags` and `skip_if_present` match with `strings.HasPrefix`; `skip_if_present` is all-or-nothing,
+  one match disables the whole injection
+- `inject.args` may reformat the answer, never suppress part of it. A flag that hides content (`--stat`,
+  `--no-merges`) needs an escape in `exclude_flags` and must be named in the output (#124)
 
 ## Release Workflow
 
@@ -97,6 +129,7 @@ A push of any `v*` tag triggers CI to build cross-platform binaries and create a
 ### Semver Tagging
 
 Every push that changes behavior **must** include a version tag:
+
 - **Patch** (`v0.1.1`): bug fixes, no API change
 - **Minor** (`v0.2.0`): new features, backward-compatible
 - **Major** (`v1.0.0`): breaking changes
@@ -119,5 +152,9 @@ git tag -a v0.1.1 -m "fix: description" && git push origin v0.1.1
 - Direct communication style — no hedging, state facts and solutions
 - TDD workflow: write test first, implement, refactor
 - Use context wrapping on errors: `fmt.Errorf("operation: %w", err)`
-- When adding a new built-in subcommand: add it to both the `switch` in `cli.go` AND `isBuiltInCommand` in `flags.go` (current builtins: init, gain, config, proxy, hook, discover)
+- When adding a new built-in subcommand: add it to both the `switch` in `cli.go` AND `isBuiltInCommand` in `flags.go` (the authoritative list of builtins)
 - When changing user-facing behavior, filters, or architecture: update the GitHub wiki (`git clone https://github.com/edouard-claude/snip.wiki.git`) to stay in sync
+- Reviewing a fix: revert the production hunk, re-run the new test, confirm it fails. Two of six PRs this
+  month shipped tests that passed either way
+- Before calling a defect a regression, reproduce it on `master` too — several reported this month were
+  pre-existing, which changes the verdict from "blocker" to "out of scope"
